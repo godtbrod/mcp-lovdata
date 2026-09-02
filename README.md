@@ -83,6 +83,31 @@ og de er en etablert rettskilde i forvaltningsretten.
 («E-12/26») uten parter, tema eller sammendrag, og sakssidene rendres med JavaScript.
 Det finnes ingen maskinlesbar inngang til innholdet.
 
+## Kommandolinje
+
+De samme kildene finnes som kommandoen `lovdata`. Den importerer modulene direkte —
+ingen JSON-RPC-omvei — så lokale søk svarer på under et tiendedels sekund.
+
+```bash
+lovdata sok '"organinterne dokumenter"'      # søk i alle paragrafer
+lovdata p offentleglova 11                   # én paragraf ordrett
+lovdata lov arbeidsmiljøloven                # metadata og innholdsfortegnelse
+lovdata fa offentleglova                     # forarbeider
+lovdata sak 89888 --tekst                    # stortingssak med dokumenttekst
+lovdata emd --art 8 --viktighet 1            # EMD-dommer mot Norge
+lovdata dom 001-214433 --del "FOR THESE REASONS"
+lovdata ombud innsyn byggesak                # Sivilombudet
+lovdata status
+```
+
+`--json` gir rå JSON på stdout for videre behandling. `lovdata hjelp` viser alt.
+
+Installer wrapperen:
+
+```bash
+ln -sf ~/Work/mcp-lovdata/src/cli.js ~/.local/bin/lovdata
+```
+
 ## Installasjon
 
 ```bash

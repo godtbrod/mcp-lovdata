@@ -1,11 +1,12 @@
 {
   "name": "mcp-lovdata",
   "version": "0.1.0",
-  "description": "MCP-server for Lovdatas åpne data — norske lover og sentrale forskrifter, indeksert lokalt og søkbare i fulltekst",
+  "description": "MCP-server for Lovdatas \u00e5pne data \u2014 norske lover og sentrale forskrifter, indeksert lokalt og s\u00f8kbare i fulltekst",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "mcp-lovdata": "src/index.js"
+    "mcp-lovdata": "src/index.js",
+    "lovdata": "src/cli.js"
   },
   "engines": {
     "node": ">=22"
@@ -13,9 +14,17 @@
   "scripts": {
     "start": "node src/index.js",
     "sync": "node src/sync.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "cli": "node src/cli.js"
   },
-  "keywords": ["mcp", "lovdata", "norway", "law", "regulations", "fts5"],
+  "keywords": [
+    "mcp",
+    "lovdata",
+    "norway",
+    "law",
+    "regulations",
+    "fts5"
+  ],
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
