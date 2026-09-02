@@ -163,7 +163,12 @@ server.registerTool(
       språk: d.language,
       url: d.url ?? undefined,
       antallParagrafer: arts.length,
-      innhold: arts.map((a) => [a.chapter, a.name, a.heading].filter(Boolean).join(" · ")),
+      // Overskriften inneholder som regel paragrafnummeret allerede.
+      innhold: arts.map((a) =>
+        [a.chapter, a.heading?.startsWith(a.name.replace(/§/, "§ ")) || a.heading?.startsWith(a.name) ? a.heading : [a.name, a.heading].filter(Boolean).join(" ")]
+          .filter(Boolean)
+          .join(" · "),
+      ),
       andreTreff: matches.slice(1, 4).map((m) => `${label(m)} (${m.type}, ${m.id})`),
     };
     if (includeText) {

@@ -30,7 +30,10 @@ export function decodeEntities(s) {
 export function stripTags(html) {
   return decodeEntities(
     html
-      .replace(/<\/(p|div|li|article|section|h[1-6]|tr)>/gi, "\n")
+      // Lister i lovtekst er ofte selve vilkårene. Uten skift foran punktet
+      // klistrer de seg til den innledende setningen: «får vite om:noens …».
+      .replace(/<(li|ol|ul|table)\b[^>]*>/gi, "\n")
+      .replace(/<\/(p|div|article|section|h[1-6]|tr|ol|ul)>/gi, "\n")
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<[^>]+>/g, ""),
   )

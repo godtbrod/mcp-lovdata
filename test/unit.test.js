@@ -15,6 +15,17 @@ test("stripTags gir lesbar tekst med linjeskift per avsnitt", () => {
   assert.equal(stripTags(html), "Første ledd.\nAndre ledd.");
 });
 
+test("stripTags skiller listepunkter fra den innledende setningen", () => {
+  const html =
+    '<article class="legalP">plikter å hindre at andre får vite om:' +
+    '<ol class="defaultList"><li>noens personlige forhold, eller</li>' +
+    "<li>tekniske innretninger</li></ol></article>";
+  const lines = stripTags(html).split("\n").filter(Boolean);
+  assert.equal(lines[0], "plikter å hindre at andre får vite om:");
+  assert.equal(lines[1], "noens personlige forhold, eller");
+  assert.equal(lines[2], "tekniske innretninger");
+});
+
 test("outerElements finner ytterste element og hopper over nøstede", () => {
   const html =
     '<article class="legalArticle" data-name="§1">ute<article class="legalP">inne</article></article>' +
