@@ -7,6 +7,7 @@ import { z } from "zod";
 import { dbPath } from "./db.js";
 import { Corpus } from "./query.js";
 import { sync } from "./corpus.js";
+import { getCaselaw, searchCaselaw } from "./hudoc.js";
 
 const DOC_TYPES = ["lov", "forskrift", "delegering", "instruks", "stortingsvedtak"];
 
@@ -26,6 +27,12 @@ const server = new McpServer(
       "  2. `get_article` for hele paragrafen når utdraget ikke er nok.",
       "  3. `get_document` for metadata, hjemmel og innholdsfortegnelse.",
       "Kjenner du lovens navn, gå rett på `get_document` med f.eks. «arbeidsmiljøloven».",
+      "",
+      "RETTSPRAKSIS: `caselaw_search` og `caselaw_get` søker i Den europeiske",
+      "menneskerettsdomstolen (EMD) via Europarådets åpne HUDOC-base. Det er ikke",
+      "norsk rettspraksis — Høyesterett finnes ikke i noen fri, maskinlesbar kilde —",
+      "men EMD-praksis ER norsk rett: menneskerettsloven § 2 gjør EMK til norsk lov,",
+      "og § 3 gir den forrang ved motstrid med annen lovgivning.",
       "",
       "Sitér alltid paragrafen ordrett og oppgi lov og §-nummer. Datasettet oppdateres",
       "hver natt hos Lovdata; `status` viser hvor gammel den lokale indeksen er.",
@@ -315,6 +322,137 @@ server.registerTool(
     const lines = [];
     const result = await sync({ log: (m) => lines.push(m) });
     return asText({ ...result, logg: lines });
+  }),
+);
+
+// --------------------------------------------------------- Rettspraksis
+
+const ARTICLE_HINT = [
+  "EMK-artikkel som tall: 2 liv, 3 tortur, 5 frihet, 6 rettferdig rettergang,",
+  "8 privatliv og familieliv, 9 tros- og livssynsfrihet, 10 ytringsfrihet,",
+  "11 forsamlings- og foreningsfrihet, 13 effektivt rettsmiddel, 14 diskriminering.",
+  "«P1-1» er eiendomsvernet i første tilleggsprotokoll.",
+].join(" ");
+
+server.registerTool(
+  "caselaw_search",
+  {
+    title: "Søk i EMD-praksis",
+    description: [
+      "Søk i avgjørelser fra Den europeiske menneskerettsdomstolen via Europarådets",
+      "åpne HUDOC-base. Standard er dommer mot Norge, på engelsk.",
+      "",
+      "Dette er ikke norsk rettspraksis. Høyesterett og lagmannsrettene finnes ikke i",
+      "noen fri, maskinlesbar kilde — Lovdata Pro tar betalt, og domstol.no sperrer",
+      "sitt API i robots.txt. EMD-praksis er derimot åpent publisert, og er samtidig",
+      "en del av norsk rett gjennom menneskerettsloven §§ 2 og 3.",
+      "",
+      "Sett `respondent` til en annen ISO-kode for saker mot andre stater, eller til",
+      "null for alle. `importance: 2` gir bare de prinsipielle avgjørelsene.",
+      "",
+      "Leter du etter én bestemt sak, bruk `caseName` eller `appNo`. `text` søker i",
+      "hele dommens tekst og treffer derfor alle avgjørelser som SITERER saken —",
+      "nyttig for å se hvordan en dom er fulgt opp, men feil verktøy for å finne den.",
+    ].join("\n"),
+    inputSchema: {
+      text: z.string().optional().describe('Fritekst, f.eks. "child welfare" eller "care order".'),
+      respondent: z
+        .string()
+        .nullable()
+        .default("NOR")
+        .describe("Innklaget stat som ISO-kode. NOR er standard; null søker i alle stater."),
+      article: z.string().optional().describe(ARTICLE_HINT),
+      importance: z
+        .number()
+        .int()
+        .min(1)
+        .max(4)
+        .optional()
+        .describe("Ta bare med avgjørelser på dette viktighetsnivået eller høyere. 1 = Key case."),
+      branch: z
+        .enum(["GRANDCHAMBER", "CHAMBER", "COMMITTEE"])
+        .optional()
+        .describe("Storkammer, kammer eller komité."),
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fra og med denne datoen."),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Til og med denne datoen."),
+      caseName: z
+        .string()
+        .optional()
+        .describe('Søk i saksnavnet, f.eks. "Strand Lobben". Bruk dette når du leter etter én bestemt sak — fritekst i `text` treffer alle dommer som NEVNER den.'),
+      appNo: z.string().optional().describe('Klagenummer, f.eks. "37283/13".'),
+      includeDecisions: z
+        .boolean()
+        .default(false)
+        .describe("Ta med avvisningsavgjørelser og annet enn dommer."),
+      limit: z.number().int().min(1).max(50).default(10),
+      offset: z.number().int().min(0).default(0),
+    },
+  },
+  guard(async ({ text, caseName, appNo, respondent, article, importance, branch, from, to, includeDecisions, limit, offset }) => {
+    const r = await searchCaselaw({
+      text, caseName, appNo, respondent: respondent ?? undefined, article, importance, branch, from, to,
+      onlyJudgments: !includeDecisions, limit, offset,
+    });
+    return asText({
+      total: r.total,
+      vist: r.hits.length,
+      avgjørelser: r.hits,
+      hint: r.hits.length
+        ? "Bruk caselaw_get med itemid for hele dommen."
+        : "Ingen treff. Prøv uten `text`, eller løsne på artikkel og viktighet.",
+    });
+  }),
+);
+
+server.registerTool(
+  "caselaw_get",
+  {
+    title: "Hent en EMD-dom i fulltekst",
+    description: [
+      "Hele teksten i én EMD-avgjørelse, hentet på `itemid` fra et søketreff.",
+      "Dommene er lange — ofte 30 000 til 300 000 tegn — så teksten avkortes.",
+      "Sett `section` for å hoppe til den delen du trenger: THE FACTS, THE LAW,",
+      "eller FOR THESE REASONS for domsslutningen.",
+    ].join(" "),
+    inputSchema: {
+      itemid: z.string().min(3).describe("HUDOC-id fra et søketreff, f.eks. 001-250427."),
+      section: z
+        .string()
+        .optional()
+        .describe('Hopp til første forekomst av denne teksten, f.eks. "THE LAW" eller "FOR THESE REASONS".'),
+      maxChars: z.number().int().min(1000).max(120_000).default(30_000),
+    },
+  },
+  guard(async ({ itemid, section, maxChars }) => {
+    const doc = await getCaselaw(itemid);
+    let text = doc.text;
+    let from = 0;
+    if (section) {
+      // Ikke toUpperCase().indexOf(): enkelte tegn (ß, ﬁ) blir lengre i versaler,
+      // og da peker indeksen inn i feil posisjon i originalteksten.
+      const needle = new RegExp(section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      const found = needle.exec(text.slice(200));
+      const i = found ? found.index + 200 : -1;
+      if (i === -1) {
+        return asError(
+          `Fant ikke «${section}» i dommen. Overskriftene i teksten er: ${
+            [...text.matchAll(/^[A-Z][A-Z .,'()-]{6,60}$/gm)].map((m) => m[0].trim()).slice(0, 12).join(" | ")
+          }`,
+        );
+      }
+      from = i;
+      text = text.slice(i);
+    }
+    const truncated = text.length > maxChars;
+    return asText({
+      itemid,
+      url: doc.url,
+      pdf: doc.pdf,
+      totaltAntallTegn: doc.text.length,
+      fraPosisjon: from || undefined,
+      avkortet: truncated || undefined,
+      tekst: truncated ? `${text.slice(0, maxChars)}\n\n[… avkortet, øk maxChars eller bruk section]` : text,
+    });
   }),
 );
 

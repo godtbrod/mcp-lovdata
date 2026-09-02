@@ -30,6 +30,25 @@ metadata, kapittelstruktur, paragrafer og endringshistorikk ut av dem.
 | `list_documents` | Bla etter type, departement eller endringsdato. |
 | `status` | Når indeksen sist ble bygget, og hvor mye den inneholder. |
 | `sync` | Henter ferske datapakker og bygger indeksen om. |
+| `caselaw_search` | Søker i EMD-praksis via Europarådets åpne HUDOC-base. |
+| `caselaw_get` | Henter én EMD-dom i fulltekst, med mulighet for å hoppe til en seksjon. |
+
+## Rettspraksis
+
+Norsk rettspraksis finnes ikke i noen fri, maskinlesbar kilde. Lovdata Pro tar betalt
+for Høyesterett og lagmannsrettene, og domstol.no sperrer `/api` i robots.txt.
+
+Det som derimot er åpent, er Den europeiske menneskerettsdomstolen gjennom Europarådets
+HUDOC-base — og den er ikke et sidespor: menneskerettsloven § 2 gjør EMK til norsk lov,
+og § 3 gir den forrang ved motstrid med annen lovgivning. Basen har 906 avgjørelser mot
+Norge, med fulltekst, artikkelhenvisninger og konklusjon.
+
+`caselaw_search` går live mot HUDOC — ingen lokal indeks, ingen autentisering. Vær
+oppmerksom på to feller i deres spørresyntaks:
+
+- **`sort` er obligatorisk.** Uten den svarer HUDOC med en 404-side i HTML.
+- **Ukjente sorteringsfelt gir stille null treff**, ikke en feilmelding. `rank` er ett
+  av dem, så relevanssortering finnes ikke — bruk `caseName` for å finne én bestemt sak.
 
 ## Installasjon
 

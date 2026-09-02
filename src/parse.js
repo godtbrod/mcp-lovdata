@@ -139,8 +139,9 @@ export function parseDocument(html, sourcePath) {
     const name = attr(art.startTag, "data-name");
     // Overskriften står som regel i h3 og inneholder da både nummer og tittel.
     // Noen forskrifter har ingen h3, bare en egen tittel-span.
+    // Lover uten kapittelinndeling bruker h2 der de kapittelinndelte bruker h3.
     const h3 = stripTags(
-      art.html.match(/<h3 class="legalArticleHeader"[^>]*>([\s\S]*?)<\/h3>/i)?.[1] ?? "",
+      art.html.match(/<h[1-6] class="legalArticleHeader"[^>]*>([\s\S]*?)<\/h[1-6]>/i)?.[1] ?? "",
     );
     const articleTitle = stripTags(
       art.html.match(/<span class="legalArticleTitle"[^>]*>([\s\S]*?)<\/span>/i)?.[1] ?? "",
@@ -154,7 +155,9 @@ export function parseDocument(html, sourcePath) {
         : "";
     // Selve lovteksten er ledd-artiklene; endringshistorikken holdes utenfor.
     const withoutChanges = art.html.replace(/<article class="changesToParent"[\s\S]*?<\/article>/gi, "");
-    const text = stripTags(withoutChanges.replace(/<h3 class="legalArticleHeader"[\s\S]*?<\/h3>/i, ""));
+    const text = stripTags(
+      withoutChanges.replace(/<h[1-6] class="legalArticleHeader"[\s\S]*?<\/h[1-6]>/i, ""),
+    );
     const changes = outerElements(art.html, "article", "changesToParent")
       .map((c) => stripTags(c.html))
       .filter(Boolean)
