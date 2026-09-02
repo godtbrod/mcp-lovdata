@@ -189,6 +189,50 @@ export class Corpus {
     return { total, rows };
   }
 
+  /** Fritekstsøk i stortingssakene — altså i forarbeidene. */
+  searchCases({ query, kind, session, limit = 10, offset = 0 }) {
+    const match = toMatchQuery(query);
+    if (!match) return { total: 0, hits: [] };
+    const where = ["1=1"];
+    const filters = { match };
+    if (kind) { where.push("c.kind = :kind"); filters.kind = kind; }
+    if (session) { where.push("c.session = :session"); filters.session = session; }
+    const clause = where.join(" AND ");
+    const params = { ...filters, limit, offset };
+    // bm25() kan ikke evalueres sammen med GROUP BY, og SQLite flater ut en vanlig
+    // subspørring slik at feilen kommer likevel. MATERIALIZED tvinger den til å
+    // regne ut rangeringen først, før sakene slås sammen på tvers av sesjoner.
+    const cte = `WITH ranked AS MATERIALIZED (
+                   SELECT case_id, bm25(cases_fts, 0.0, 2.0, 2.0, 4.0, 1.0) AS rank
+                   FROM cases_fts WHERE cases_fts MATCH :match
+                 )`;
+    const join = `FROM ranked f JOIN cases c ON c.id = f.case_id WHERE ${clause}`;
+    const total = this.db.prepare(`${cte} SELECT COUNT(DISTINCT c.id) n ${join}`).get(filters).n;
+    const hits = this.db
+      .prepare(
+        `${cte}
+         SELECT c.id, MAX(c.session) AS session, c.title, c.short_title, c.reference,
+                c.kind, c.committee, c.topics, c.updated, MIN(f.rank) AS rank
+         ${join}
+         GROUP BY c.id
+         ORDER BY session DESC, rank
+         LIMIT :limit OFFSET :offset`,
+      )
+      .all(params);
+    return { total, hits };
+  }
+
+  caseKinds() {
+    return this.db
+      .prepare("SELECT kind, COUNT(*) n FROM cases WHERE kind IS NOT NULL GROUP BY kind ORDER BY n DESC")
+      .all();
+  }
+
+  casesStatus() {
+    const row = this.db.prepare("SELECT COUNT(*) n, MIN(session) a, MAX(session) b FROM cases").get();
+    return { cases: row.n, fraSesjon: row.a, tilSesjon: row.b };
+  }
+
   close() {
     this.db.close();
   }

@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { openDb, setMeta } from "./db.js";
+import { getMeta, openDb, setMeta } from "./db.js";
+import { fetchCases, fetchSessions } from "./stortinget.js";
 import { parseDocument } from "./parse.js";
 
 const run = promisify(execFile);
@@ -128,4 +129,68 @@ async function listXml(dir) {
     if (entry.isFile() && entry.name.endsWith(".xml")) out.push(join(entry.parentPath ?? dir, entry.name));
   }
   return out.sort();
+}
+
+/**
+ * Forarbeidene fra Stortinget. Sakslistene per sesjon er små, og gamle
+ * sesjoner endrer seg ikke — derfor hentes hver sesjon bare én gang, mens de
+ * to nyeste friskes opp hver gang. Det holder ukesynken på under et minutt
+ * i stedet for 70 MB nedlasting.
+ */
+export async function syncStortinget({ log = () => {}, refreshNewest = 2 } = {}) {
+  const db = openDb({ create: true });
+  const started = Date.now();
+  try {
+    const sessions = await fetchSessions();
+    // Sesjoner fram i tid finnes i lista og har ingen saker ennå.
+    const today = new Date().toISOString().slice(0, 10);
+    const usable = sessions.filter((s) => !s.fra || s.fra <= today);
+    const newest = new Set(usable.slice(0, refreshNewest).map((s) => s.id));
+
+    const insCase = db.prepare(`INSERT OR REPLACE INTO cases
+      (id, session, title, short_title, reference, kind, committee, topics, updated)
+      VALUES (?,?,?,?,?,?,?,?,?)`);
+    const insFts = db.prepare(
+      "INSERT INTO cases_fts(case_id, title, short_title, reference, topics) VALUES (?,?,?,?,?)",
+    );
+    const dropFts = db.prepare("DELETE FROM cases_fts WHERE case_id = ?");
+    const dropSession = db.prepare("SELECT id FROM cases WHERE session = ?");
+    const dropCases = db.prepare("DELETE FROM cases WHERE session = ?");
+
+    let added = 0;
+    let skipped = 0;
+    for (const session of usable) {
+      const key = `storting_${session.id}`;
+      if (getMeta(db, key) && !newest.has(session.id)) {
+        skipped++;
+        continue;
+      }
+      let cases;
+      try {
+        cases = await fetchCases(session.id);
+      } catch (err) {
+        log(`  ${session.id}: ${err.message}`);
+        continue;
+      }
+      db.exec("BEGIN");
+      for (const row of dropSession.all(session.id)) dropFts.run(row.id);
+      dropCases.run(session.id);
+      for (const c of cases) {
+        insCase.run(c.id, c.session, c.title, c.shortTitle, c.reference, c.kind ?? null, c.committee, c.topics, c.updated);
+        insFts.run(c.id, c.title, c.shortTitle, c.reference, c.topics ?? "");
+      }
+      setMeta(db, key, String(cases.length));
+      db.exec("COMMIT");
+      added += cases.length;
+      log(`  ${session.id}: ${cases.length} saker`);
+    }
+    const total = db.prepare("SELECT COUNT(*) n FROM cases").get().n;
+    setMeta(db, "storting_synced_at", new Date().toISOString());
+    setMeta(db, "storting_cases", total);
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    log(`forarbeider: ${total} saker totalt (${added} hentet, ${skipped} sesjoner uendret) på ${seconds} s`);
+    return { cases: total, fetched: added, unchangedSessions: skipped, seconds: Number(seconds) };
+  } finally {
+    db.close();
+  }
 }

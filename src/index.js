@@ -6,8 +6,10 @@ import { z } from "zod";
 
 import { dbPath } from "./db.js";
 import { Corpus } from "./query.js";
-import { sync } from "./corpus.js";
+import { sync, syncStortinget } from "./corpus.js";
 import { getCaselaw, searchCaselaw } from "./hudoc.js";
+import { fetchCase, fetchPublication, publicationId } from "./stortinget.js";
+import { getOpinion, searchOpinions } from "./sivilombudet.js";
 
 const DOC_TYPES = ["lov", "forskrift", "delegering", "instruks", "stortingsvedtak"];
 
@@ -34,6 +36,14 @@ const server = new McpServer(
       "men EMD-praksis ER norsk rett: menneskerettsloven § 2 gjør EMK til norsk lov,",
       "og § 3 gir den forrang ved motstrid med annen lovgivning.",
       "",
+      "FORARBEIDER: `preparatory_search` og `preparatory_get` dekker Stortingets saker",
+      "fra 1986 til i dag — proposisjoner, innstillinger, meldinger og",
+      "representantforslag. Det er der lovgivers mening står, og den er en tung",
+      "rettskilde ved tolkning av uklar lovtekst.",
+      "",
+      "FORVALTNINGSPRAKSIS: `ombudsman_search` og `ombudsman_get` dekker Sivilombudets",
+      "uttalelser — tyngst på forvaltningsloven, offentleglova og saksbehandling.",
+      "",
       "Sitér alltid paragrafen ordrett og oppgi lov og §-nummer. Datasettet oppdateres",
       "hver natt hos Lovdata; `status` viser hvor gammel den lokale indeksen er.",
     ].join("\n"),
@@ -49,6 +59,23 @@ function open() {
   }
   corpus ??= new Corpus();
   return corpus;
+}
+
+/** Fjerner tomme felt rekursivt, slik at svaret ikke fylles av null. */
+function compact(obj) {
+  if (Array.isArray(obj)) {
+    const arr = obj.map(compact).filter((v) => v !== undefined);
+    return arr.length ? arr : undefined;
+  }
+  if (obj && typeof obj === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      const c = compact(v);
+      if (c !== undefined) out[k] = c;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return obj === null || obj === "" || obj === undefined ? undefined : obj;
 }
 
 const asText = (v) => ({
@@ -289,7 +316,9 @@ server.registerTool(
   },
   guard(async () => {
     if (!existsSync(dbPath())) return asText({ indeks: dbPath(), finnes: false, hint: "Kjør sync først." });
-    const s = open().status();
+    const c = open();
+    const s = c.status();
+    const forarbeider = c.casesStatus();
     const days = s.syncedAt ? (Date.now() - Date.parse(s.syncedAt)) / 86_400_000 : undefined;
     return asText({
       indeks: dbPath(),
@@ -298,6 +327,7 @@ server.registerTool(
       dokumenter: s.documents,
       paragrafer: s.articles,
       fordeling: s.byType,
+      forarbeider,
       merknad: days > 7 ? "Lovdata legger ut nye datapakker hver natt — vurder å kjøre sync." : undefined,
     });
   }),
@@ -308,9 +338,9 @@ server.registerTool(
   {
     title: "Hent ferske datapakker fra Lovdata",
     description: [
-      "Laster ned begge datasettene på nytt og bygger indeksen om fra bunnen.",
-      "Tar rundt tre minutter og laster ned ~27 MB. Lovdata legger ut nye pakker hver",
-      "natt, så det er sjelden nødvendig oftere enn ukentlig.",
+      "Laster ned Lovdata-datasettene på nytt og bygger lovindeksen om fra bunnen,",
+      "og friskner opp forarbeidene fra Stortinget. Tar rundt to minutter.",
+      "En systemd-timer kjører dette ukentlig, så det trengs sjelden manuelt.",
     ].join(" "),
     inputSchema: {},
   },
@@ -321,7 +351,8 @@ server.registerTool(
     }
     const lines = [];
     const result = await sync({ log: (m) => lines.push(m) });
-    return asText({ ...result, logg: lines });
+    const forarbeider = await syncStortinget({ log: (m) => lines.push(m) });
+    return asText({ ...result, forarbeider, logg: lines });
   }),
 );
 
@@ -454,6 +485,163 @@ server.registerTool(
       tekst: truncated ? `${text.slice(0, maxChars)}\n\n[… avkortet, øk maxChars eller bruk section]` : text,
     });
   }),
+);
+
+// ---------------------------------------------------------- Forarbeider
+
+server.registerTool(
+  "preparatory_search",
+  {
+    title: "Søk i forarbeider",
+    description: [
+      "Søk i Stortingets saker fra 1986 til i dag: proposisjoner, innstillinger,",
+      "stortingsmeldinger og representantforslag. Dette er forarbeidene — der",
+      "lovgivers mening står, og en tung rettskilde når lovteksten er uklar.",
+      "",
+      "Søket går mot sakstitler, henvisninger og emneord, ikke mot dokumentteksten:",
+      "Stortingets API har ingen fritekstsøk i selve dokumentene. Søk derfor på det",
+      "loven eller saken heter, ikke på en formulering du forventer å finne inni.",
+      "",
+      "Henvisningen i treffet («Prop. 12 L (2024–2025)») er det du siterer, og det",
+      "`preparatory_get` bruker for å hente teksten.",
+    ].join("\n"),
+    inputSchema: {
+      query: z.string().min(2).describe('Stikkord fra sakstittelen, f.eks. "arbeidsmiljøloven prøvetid".'),
+      kind: z
+        .enum(["Lovproposisjon", "Proposisjon", "Innstilling", "Stortingsmelding", "Representantforslag", "Dokumentserien"])
+        .optional()
+        .describe("Begrens til én dokumenttype. Lovproposisjon (Prop. L) er der lovendringer begrunnes."),
+      session: z.string().regex(/^\d{4}-\d{2,4}$/).optional().describe('Stortingssesjon, f.eks. "2024-2025".'),
+      limit: z.number().int().min(1).max(50).default(10),
+      offset: z.number().int().min(0).default(0),
+    },
+  },
+  guard(async ({ query, kind, session, limit, offset }) => {
+    const c = open();
+    const { total, hits } = c.searchCases({ query, kind, session, limit, offset });
+    return asText({
+      total,
+      vist: hits.length,
+      saker: hits.map((h) =>
+        compact({
+          sakId: h.id,
+          sesjon: h.session,
+          henvisning: h.reference || undefined,
+          dokumenttype: h.kind ?? undefined,
+          tittel: h.short_title || h.title,
+          komite: h.committee ?? undefined,
+          emner: h.topics ?? undefined,
+        }),
+      ),
+      hint: hits.length
+        ? "Bruk preparatory_get med sakId for saksgang, vedtak og dokumenttekst."
+        : // Søket går mot titler, ikke dokumenttekst — flere ord blir fort for smalt.
+          `Ingen treff. Søket dekker sakstitler og emneord, ikke dokumentteksten, og alle ordene må stå i samme tittel. Prøv færre ord — «${
+            query.split(/\s+/)[0]
+          }» alene.`,
+    });
+  }),
+);
+
+server.registerTool(
+  "preparatory_get",
+  {
+    title: "Hent en stortingssak med dokumenttekst",
+    description: [
+      "Detaljer om én sak: emner, komité, saksgang, vedtak og lenker til dokumentene.",
+      "Sett `includeText` for å hente selve teksten i innstillingen eller proposisjonen",
+      "— den er ofte lang, så den avkortes.",
+    ].join(" "),
+    inputSchema: {
+      caseId: z.string().min(1).describe("sakId fra et søketreff."),
+      includeText: z.boolean().default(false).describe("Hent dokumentteksten, ikke bare metadataene."),
+      maxChars: z.number().int().min(1000).max(150_000).default(30_000),
+    },
+  },
+  guard(async ({ caseId, includeText, maxChars }) => {
+    const sak = await fetchCase(caseId);
+    const out = compact({
+      sakId: sak.id,
+      sesjon: sak.session,
+      henvisning: sak.reference,
+      dokumenttype: sak.kind,
+      tittel: sak.shortTitle || sak.title,
+      komite: sak.committee,
+      ferdigbehandlet: sak.finished,
+      emner: sak.topics,
+      stikkord: sak.keywords,
+      saksgang: sak.steps,
+      vedtak: sak.decision,
+      innstilling: sak.recommendation,
+      dokumenter: sak.documents,
+      url: sak.url,
+    });
+    if (includeText) {
+      // Publikasjons-IDen utledes av henvisningen; en sak kan ha flere referanser.
+      const refs = (sak.reference ?? "").split(",").map((r) => r.trim()).filter(Boolean);
+      for (const ref of refs) {
+        const pid = publicationId(ref, sak.session);
+        if (!pid) continue;
+        try {
+          const pub = await fetchPublication(pid);
+          if (!pub.text) continue;
+          out.tekstFra = ref;
+          out.totaltAntallTegn = pub.text.length;
+          out.tekst =
+            pub.text.length > maxChars ? `${pub.text.slice(0, maxChars)}\n\n[… avkortet]` : pub.text;
+          break;
+        } catch {
+          // Ikke alle henvisninger har en publikasjon i eksporten; prøv neste.
+        }
+      }
+      if (!out.tekst) out.merknad = `Fant ingen dokumenttekst for «${sak.reference}». Bruk lenkene i dokumenter.`;
+    }
+    return asText(out);
+  }),
+);
+
+// ------------------------------------------------------ Sivilombudet
+
+server.registerTool(
+  "ombudsman_search",
+  {
+    title: "Søk i Sivilombudets uttalelser",
+    description: [
+      "Fulltekstsøk i Sivilombudets uttalelser — omtrent 2 000 saker om forvaltningens",
+      "saksbehandling. Tyngst på offentleglova, forvaltningsloven, innsyn, habilitet,",
+      "taushetsplikt og begrunnelsesplikt.",
+      "",
+      "Uttalelsene er ikke bindende som en dom, men forvaltningen retter seg etter dem",
+      "i praksis, og de er en etablert rettskilde i forvaltningsretten.",
+      "Sett `type: \"besoksrapporter\"` for besøksrapportene fra forebyggingsenheten.",
+    ].join("\n"),
+    inputSchema: {
+      query: z.string().min(2).describe('Søkeord, f.eks. "innsyn interne dokumenter".'),
+      type: z.enum(["uttalelser", "besoksrapporter"]).default("uttalelser"),
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fra og med denne datoen."),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Til og med denne datoen."),
+      limit: z.number().int().min(1).max(50).default(10),
+      offset: z.number().int().min(0).default(0),
+    },
+  },
+  guard(async ({ query, type, from, to, limit, offset }) =>
+    asText(await searchOpinions({ query, type, from, to, limit, offset })),
+  ),
+);
+
+server.registerTool(
+  "ombudsman_get",
+  {
+    title: "Hent en uttalelse fra Sivilombudet",
+    description:
+      "Hele teksten i én uttalelse. Saksnummeret står i teksten som SOM-ÅÅÅÅ-NNNN, og det er slik uttalelsen siteres.",
+    inputSchema: {
+      id: z.number().int().describe("id fra et søketreff."),
+      type: z.enum(["uttalelser", "besoksrapporter"]).default("uttalelser"),
+      maxChars: z.number().int().min(1000).max(120_000).default(30_000),
+    },
+  },
+  guard(async ({ id, type, maxChars }) => asText(await getOpinion(id, { type, maxChars }))),
 );
 
 await server.connect(new StdioServerTransport());

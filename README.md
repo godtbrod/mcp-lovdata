@@ -32,6 +32,10 @@ metadata, kapittelstruktur, paragrafer og endringshistorikk ut av dem.
 | `sync` | Henter ferske datapakker og bygger indeksen om. |
 | `caselaw_search` | Søker i EMD-praksis via Europarådets åpne HUDOC-base. |
 | `caselaw_get` | Henter én EMD-dom i fulltekst, med mulighet for å hoppe til en seksjon. |
+| `preparatory_search` | Søker i Stortingets saker fra 1986 — forarbeidene. |
+| `preparatory_get` | Saksgang, vedtak og dokumenttekst for én stortingssak. |
+| `ombudsman_search` | Søker i Sivilombudets uttalelser. |
+| `ombudsman_get` | Henter én uttalelse i fulltekst. |
 
 ## Rettspraksis
 
@@ -49,6 +53,35 @@ oppmerksom på to feller i deres spørresyntaks:
 - **`sort` er obligatorisk.** Uten den svarer HUDOC med en 404-side i HTML.
 - **Ukjente sorteringsfelt gir stille null treff**, ikke en feilmelding. `rank` er ett
   av dem, så relevanssortering finnes ikke — bruk `caseName` for å finne én bestemt sak.
+
+## Forarbeider
+
+Stortingets API (`data.stortinget.no`, versjon 1.6) er åpent og uten autentisering,
+men har **ingen fritekstsøk** — bare uttrekk per sesjon. Sakslistene er små og gamle
+sesjoner endrer seg aldri, så de indekseres lokalt sammen med lovtekstene: 24 870 saker
+fra 1986-87 til i dag. Bare de to nyeste sesjonene hentes på nytt ved hver sync.
+
+Søket dekker sakstitler, henvisninger og emneord — ikke dokumentteksten. Selve teksten
+i innstillinger og proposisjoner hentes live på forespørsel.
+
+To ting API-et krever at man vet:
+
+- **Datoene er lokal midnatt** i formatet `/Date(1787522400000+0200)/`. Uten å legge til
+  offsetet havner man konsekvent på dagen før.
+- **Samme sak ligger i to sesjoner** — den den ble fremmet i og den den ble behandlet i,
+  med samme id. Nøkkelen må være sak pluss sesjon, ellers forsvinner 1 100 saker.
+
+## Forvaltningspraksis
+
+Sivilombudets uttalelser via WordPress' åpne REST-API: 1 965 saker med fulltekst og
+fungerende serversøk. Ikke bindende som en dom, men forvaltningen retter seg etter dem,
+og de er en etablert rettskilde i forvaltningsretten.
+
+## Det som ikke er med
+
+**EFTA-domstolen** ble undersøkt og forkastet. REST-API-et deres gir bare saksnummer
+(«E-12/26») uten parter, tema eller sammendrag, og sakssidene rendres med JavaScript.
+Det finnes ingen maskinlesbar inngang til innholdet.
 
 ## Installasjon
 

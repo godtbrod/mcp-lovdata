@@ -38,6 +38,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   content='articles', content_rowid='rowid',
   tokenize="unicode61 remove_diacritics 0"
 );
+-- Stortingssaker: forarbeidene. Indekseres inkrementelt, ikke sammen med
+-- lovtekstene, fordi gamle sesjoner aldri endrer seg.
+CREATE TABLE IF NOT EXISTS cases (
+  -- Samme sak går igjen i sesjonen den ble fremmet og den den ble behandlet,
+  -- med samme id. Nøkkelen må derfor være sak pluss sesjon.
+  id TEXT NOT NULL,
+  session TEXT NOT NULL,
+  title TEXT, short_title TEXT, reference TEXT, kind TEXT,
+  committee TEXT, topics TEXT, updated TEXT,
+  PRIMARY KEY (id, session)
+);
+CREATE INDEX IF NOT EXISTS cases_session ON cases(session);
+CREATE INDEX IF NOT EXISTS cases_kind ON cases(kind);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5(
+  case_id UNINDEXED, title, short_title, reference, topics,
+  tokenize="unicode61 remove_diacritics 0"
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   doc_id UNINDEXED, title, short_title, ministry, legal_areas,
   tokenize="unicode61 remove_diacritics 0"
