@@ -31,6 +31,14 @@ test("buildQuery skiller saksnavn fra fritekst", () => {
   assert.match(q, /\(care order\)/);
 });
 
+test("buildQuery utelater staten når den ikke er satt", () => {
+  // null betyr «alle stater». Gjøres den om til undefined underveis, slår
+  // JavaScripts standardverdi «NOR» inn igjen og søket blir stille begrenset.
+  assert.doesNotMatch(buildQuery({ respondent: undefined }), /respondent/);
+  assert.doesNotMatch(buildQuery({ respondent: null }), /respondent/);
+  assert.match(buildQuery({ respondent: "NOR" }), /respondent:"NOR"/);
+});
+
 test("buildQuery fjerner anførselstegn i verdier", () => {
   // Ubalanserte anførselstegn får HUDOC til å svare med en 404-side.
   assert.match(buildQuery({ caseName: 'A "quoted" name' }), /docname:"A quoted name"/);

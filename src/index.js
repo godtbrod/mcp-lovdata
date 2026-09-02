@@ -421,7 +421,9 @@ server.registerTool(
   },
   guard(async ({ text, caseName, appNo, respondent, article, importance, branch, from, to, includeDecisions, limit, offset }) => {
     const r = await searchCaselaw({
-      text, caseName, appNo, respondent: respondent ?? undefined, article, importance, branch, from, to,
+      // null må sendes videre som null: gjøres den om til undefined, slår
+      // standardverdien «NOR» inn igjen og «alle stater» blir stille til Norge.
+      text, caseName, appNo, respondent, article, importance, branch, from, to,
       onlyJudgments: !includeDecisions, limit, offset,
     });
     return asText({

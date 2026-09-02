@@ -137,7 +137,9 @@ export async function searchCaselaw({
   text, respondent = "NOR", article, from, to, importance, branch,
   caseName, appNo, language = "ENG", onlyJudgments = true, limit = 10, offset = 0,
 }) {
-  const query = buildQuery({ text, caseName, appNo, respondent, article, from, to, importance, branch, onlyJudgments });
+  // null betyr «alle stater»; undefined betyr «ikke oppgitt», altså Norge.
+  const state = respondent === null ? undefined : respondent;
+  const query = buildQuery({ text, caseName, appNo, respondent: state, article, from, to, importance, branch, onlyJudgments });
   const withLang = language ? `${query} AND (languageisocode:${quote(language)})` : query;
   const data = await get("/app/query/results", {
     query: withLang,
