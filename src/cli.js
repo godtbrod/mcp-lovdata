@@ -54,7 +54,8 @@ ${bold("Flagg")}
   --tegn N        tak for tekstlengde
 
 ${dim("Søkene er strenge OG: alle ordene må stå i samme paragraf, tittel,")}
-${dim('uttalelse eller dom. Færre ord gir flere treff. "Frase i hermetegn" er eksakt.')}`;
+${dim("uttalelse eller dom. Færre ord gir flere treff. Bøyning tas av seg selv —")}
+${dim('"oppsigelse" treffer "oppsigelsen". "Ord i hermetegn" er eksakt form.')}`;
 
 function parseArgs(argv) {
   const flags = {};

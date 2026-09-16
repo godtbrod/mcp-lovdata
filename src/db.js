@@ -100,6 +100,16 @@ const STOPPORD = new Set(
     .split(" "),
 );
 
+/**
+ * Norsk bøyer i endelsen, og unicode61 har ingen stemming: «oppsigelse» og
+ * «oppsigelsen» er to ulike tokens. Søket «oppsigelse prøvetid» mistet derfor
+ * aml § 15-6 helt, fordi paragrafen skriver bestemt form. Hvert ord søkes
+ * som prefiks i stedet — men bare fra fire tegn, ellers ville «bil» dratt inn
+ * «bilag» og «lov» alt som er lovlig. Vil du ha eksakt form, sett ordet i
+ * anførselstegn: det går rett i frasegrenen og røres ikke.
+ */
+const MIN_PREFIKS = 4;
+
 export function toMatchQuery(input) {
   const trimmed = input.trim();
   if (!trimmed) return "";
@@ -116,8 +126,10 @@ export function toMatchQuery(input) {
     .map((w) => w.toLowerCase());
   const meaningful = words.filter((w) => !STOPPORD.has(w));
   const chosen = meaningful.length ? meaningful : words;
-  const quoted = chosen.map((w) =>
-    w.endsWith("*") ? `"${w.slice(0, -1).replace(/"/g, "")}"*` : `"${w.replace(/"/g, "")}"`,
-  );
+  const quoted = chosen.map((w) => {
+    if (w.endsWith("*")) return `"${w.slice(0, -1).replace(/"/g, "")}"*`;
+    const bare = w.replace(/"/g, "");
+    return bare.length >= MIN_PREFIKS ? `"${bare}"*` : `"${bare}"`;
+  });
   return [...phrases, ...quoted].join(" ");
 }

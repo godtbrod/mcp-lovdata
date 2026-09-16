@@ -85,14 +85,24 @@ test("parseDocument skiller nynorskutgaven fra bokmålsutgaven", () => {
 });
 
 test("toMatchQuery siterer ord og lar fraser stå", () => {
-  assert.equal(toMatchQuery("oppsigelse prøvetid"), '"oppsigelse" "prøvetid"');
+  assert.equal(toMatchQuery("oppsigelse prøvetid"), '"oppsigelse"* "prøvetid"*');
   assert.equal(toMatchQuery('"tvungent psykisk helsevern"'), '"tvungent psykisk helsevern"');
   assert.equal(toMatchQuery("arbeidsgiv*"), '"arbeidsgiv"*');
 });
 
+test("toMatchQuery søker prefiks, så bøyning ikke skjuler treff", () => {
+  // «oppsigelsen» i paragrafteksten skal treffes av «oppsigelse» i søket.
+  assert.equal(toMatchQuery("oppsigelse"), '"oppsigelse"*');
+  // Korte ord ville dratt inn for mye: «bil*» treffer «bilag» og «bilde».
+  assert.equal(toMatchQuery("bil"), '"bil"');
+  assert.equal(toMatchQuery("barn"), '"barn"*', "fire tegn er grensen, og den er med");
+  // Anførselstegn er veien ut når eksakt form er poenget.
+  assert.equal(toMatchQuery('"oppsigelse"'), '"oppsigelse"');
+});
+
 test("toMatchQuery fjerner bindeord, men ikke inne i fraser", () => {
-  assert.equal(toMatchQuery("oppsigelse i prøvetiden"), '"oppsigelse" "prøvetiden"');
-  assert.equal(toMatchQuery('"i og med" støy'), '"i og med" "støy"');
+  assert.equal(toMatchQuery("oppsigelse i prøvetiden"), '"oppsigelse"* "prøvetiden"*');
+  assert.equal(toMatchQuery('"i og med" støy'), '"i og med" "støy"*');
 });
 
 test("toMatchQuery beholder ordene når alt er bindeord", () => {

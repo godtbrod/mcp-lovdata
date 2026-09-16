@@ -135,6 +135,11 @@ Indeksen havner i `~/.local/share/mcp-lovdata/lovdata.db` (~150 MB). Overstyr me
 - **Bindeord fjernes fra søket.** FTS5 krever at alle ord finnes, så «oppsigelse i
   prøvetiden» mistet ellers treff bare fordi «i» ikke sto i paragrafen. Fraser i
   anførselstegn røres ikke.
+- **Søkeord matches som prefiks.** `unicode61` har ingen stemming, og norsk bøyer i
+  endelsen, så «oppsigelse» og «oppsigelsen» var to ulike tokens — «oppsigelse
+  prøvetid» fant ikke aml § 15-6 i det hele tatt, fordi paragrafen skriver bestemt
+  form. Ord fra fire tegn søkes derfor som prefiks. Kortere ord holdes eksakte, ellers
+  ville «bil» dratt inn «bilag». Anførselstegn rundt ett ord gir eksakt form tilbake.
 - **Rangering.** Paragrafsøk vekter paragrafnavn og overskrift over brødtekst.
   Navneoppslag løfter treff der navnet står i tittelens parentes — det er der
   kortnavnet står, som i «Lov om arbeidsmiljø … (arbeidsmiljøloven)» — og foretrekker
