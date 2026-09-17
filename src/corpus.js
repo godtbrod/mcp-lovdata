@@ -367,6 +367,8 @@ export async function syncLovtidend({ log = () => {}, history, force = false } =
       result.hentet.push({ pakke: pkg.filename, kunngjøringer: documents, hoppetOver: skipped || undefined });
     }
 
+    // Også når alt var uendret: indeksen ER ajour, og det er det alderen sier noe om.
+    setMeta(db, "synced_at", new Date().toISOString());
     if (result.hentet.length) {
       db.exec("INSERT INTO gazette_fts(gazette_fts) VALUES('optimize')");
       // Uten statistikk gjettet planleggeren feil og leste seg gjennom hele

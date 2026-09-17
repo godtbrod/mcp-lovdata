@@ -682,7 +682,14 @@ server.registerTool(
 function asRefid(value) {
   const direct = toRefid(value);
   if (direct) return { refid: direct };
-  const matches = open().resolve(value);
+  let corpusRef;
+  try {
+    corpusRef = open();
+  } catch (err) {
+    // Navneoppslag krever lovindeksen; koden krever den ikke.
+    throw new Error(`«${value}» må slås opp i lovindeksen, og den er ikke klar. ${err.message} Koden virker uansett, f.eks. «LOV-1988-04-29-21».`);
+  }
+  const matches = corpusRef.resolve(value);
   if (!matches.length) return {};
   return { refid: toRefid(matches[0].id), tolket: `${label(matches[0])} (${matches[0].legacy_id ?? matches[0].id})` };
 }
@@ -830,7 +837,9 @@ server.registerTool(
           hits.length === 0
             ? paragraf
               ? "Ingen treff. Paragrafene leses ut av teksten i eldre kunngjøringer og kan mangle — prøv uten `paragraf`."
-              : "Ingen treff. Sjekk `status` for hvilke årganger som er hentet, eller løsne på filtrene."
+              : ministry
+                ? `Ingen treff. Departementene skrives fullt ut: ${lt.ministries().join(", ")}.`
+                : "Ingen treff. Sjekk `status` for hvilke årganger som er hentet, eller løsne på filtrene."
             : total > hits.length + offset
               ? "Flere treff finnes — bruk offset for å bla."
               : undefined,
