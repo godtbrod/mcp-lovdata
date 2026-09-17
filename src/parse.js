@@ -86,7 +86,8 @@ function metadataLinks(head, key) {
 
 /** Dokumenttype utledes av mappa i arkivet og av dokid-prefikset. */
 export function documentType(sourcePath) {
-  const dir = sourcePath.split("/").at(-2);
+  // Windows-stier bruker \ som skille, så begge deler må splittes på.
+  const dir = sourcePath.split(/[/\\]/).at(-2);
   return { nl: "lov", sf: "forskrift", del: "delegering", ins: "instruks", stv: "stortingsvedtak" }[dir] ?? "ukjent";
 }
 
