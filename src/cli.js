@@ -4,8 +4,9 @@
  * Importerer modulene direkte — ingen JSON-RPC-omvei — så lokale søk
  * svarer på millisekunder.
  */
-import { dbPath, indexProblem } from "./db.js";
-import { Corpus } from "./query.js";
+import { dbPath, indexProblem, lovtidendProblem } from "./db.js";
+import { Corpus, Lovtidend } from "./query.js";
+import { normalizeArticle, periodEnd, periodStart, toLegacyId, toRefid } from "./lovtidend.js";
 
 const ESC = "\u001b";
 const isTty = process.stdout.isTTY;
@@ -21,6 +22,11 @@ ${bold("Lovtekst")}
   lovdata lov <navn>                metadata og innholdsfortegnelse
   lovdata p <lov> <paragraf>        én paragraf ordrett
   lovdata titler <ord...>           søk i dokumenttitler
+
+${bold("Lovtidend — endringer, med dato")}
+  lovdata lt <ord...>               søk i kunngjøringene
+  lovdata lt --endrer <lov>         alt som er endret i en lov
+  lovdata kg <kode>                 hele kunngjøringen
 
 ${bold("Forarbeider")}
   lovdata fa <ord...>               søk i Stortingets saker
@@ -43,6 +49,12 @@ ${bold("Flagg")}
   --limit N       antall treff (standard 10)
   --type X        lov | forskrift | delegering | instruks | stortingsvedtak
   --doc ID        avgrens sok til ett dokument
+  --endrer LOV    lovtidend: dokumentet som ble endret
+  --paragraf P    lovtidend: bare endringer i denne bestemmelsen
+  --dep NAVN      lovtidend: delstreng av departement eller etat
+  --fra ÅR        lovtidend: kunngjort fra og med (år, måned eller dato)
+  --til ÅR        lovtidend: kunngjort til og med
+  --historikk     sync: ta med Lovtidend 2001-i fjor (70 MB)
   --art N         EMK-artikkel for emd
   --stat KODE     ISO-kode for emd, «alle» for alle stater
   --sak NAVN      søk emd på saksnavn
@@ -82,6 +94,28 @@ function requireIndex() {
     process.exit(2);
   }
   return new Corpus();
+}
+
+function requireLovtidend() {
+  const problem = lovtidendProblem();
+  if (problem) {
+    console.error(`lovdata: ${problem} Kjør «lovdata sync» (legg til --historikk for 2001 og framover).`);
+    process.exit(2);
+  }
+  return new Lovtidend();
+}
+
+/** Lovtidend lenker med refid; brukeren skriver lovens navn. */
+function refidOf(value) {
+  const direct = toRefid(String(value));
+  if (direct) return direct;
+  const matches = requireIndex().resolve(String(value));
+  if (!matches.length) {
+    console.error(`lovdata: fant ingen lov eller forskrift som matcher «${value}».`);
+    process.exit(1);
+  }
+  console.error(dim(`(tolket «${value}» som ${matches[0].short_title || matches[0].title})`));
+  return toRefid(matches[0].id);
 }
 
 /** Bryter tekst på ordgrense, med innrykk. */
@@ -200,6 +234,64 @@ const commands = {
       console.log(`\n${wrap(a.text, "")}`);
       if (a.changes) console.log(`\n${dim(`Endringer: ${a.changes}`)}`);
       console.log(dim(`\nhttps://lovdata.no/dokument/${d.id}/${a.name}`));
+    });
+  },
+
+  lt(args, flags) {
+    const lovtidend = requireLovtidend();
+    const endrer = flags.endrer ? refidOf(flags.endrer) : undefined;
+    const { total, hits } = lovtidend.search({
+      query: args.join(" ") || undefined,
+      endrer,
+      article: flags.paragraf ? normalizeArticle(String(flags.paragraf)) : undefined,
+      type: flags.type,
+      ministry: flags.dep,
+      from: periodStart(flags.fra),
+      to: periodEnd(flags.til),
+      limit: num(flags.limit, 10),
+    });
+    out(flags, { total, hits }, () => {
+      if (!total) return console.log(dim("Ingen treff. «lovdata status» viser hvilke årganger som er hentet."));
+      console.log(dim(`${total} kunngjøringer`));
+      for (const h of hits) {
+        console.log(`\n${bold(h.short_title || h.title)} ${dim(`(${h.type})`)}`);
+        console.log(dim(`  ${h.legacy_id} · kunngjort ${h.published_date} · i kraft ${h.in_force ?? "-"}`));
+        if (h.ministry) console.log(dim(`  ${h.ministry}`));
+        // Gruppert per dokument: en kunngjøring kan endre flere lover, og da
+        // sier en lang rekke paragrafnumre uten eier ingenting.
+        const perDoc = new Map();
+        for (const change of h.changes) {
+          if (!change.article) continue;
+          perDoc.set(change.target, [...(perDoc.get(change.target) ?? []), change.article]);
+        }
+        for (const [target, articles] of [...perDoc].slice(0, 4)) {
+          console.log(`  ${dim(toLegacyId(target) ?? target)} ${cyan(articles.slice(0, 12).join(", "))}`);
+        }
+        if (args.length) console.log(wrap(h.snippet.replace(/«([^»]*)»/g, (_, w) => c(33, w))));
+      }
+    });
+  },
+
+  kg(args, flags) {
+    const lovtidend = requireLovtidend();
+    const doc = lovtidend.get(args.join(" "));
+    if (!doc) {
+      console.error("lovdata: fant ingen kunngjøring med den koden.");
+      process.exit(1);
+    }
+    out(flags, doc, () => {
+      console.log(bold(doc.title));
+      console.log(dim(`${doc.legacy_id} · ${doc.ministry ?? "-"}`));
+      console.log(`\n${dim("Kunngjort:")} ${doc.published ?? "-"}`);
+      console.log(`${dim("I kraft:  ")} ${doc.in_force ?? "-"}`);
+      for (const r of doc.inForceBy) console.log(dim(`  satt i kraft ${r.in_force} ved ${r.legacy_id}`));
+      if (doc.misc) console.log(`\n${wrap(doc.misc, "")}`);
+      const endrer = doc.changes.filter((x) => x.article === null).map((x) => toLegacyId(x.target) ?? x.target);
+      if (endrer.length) console.log(`\n${dim("Endrer:")} ${endrer.join(", ")}`);
+      const cap = num(flags.tegn, 8000);
+      console.log(`\n${wrap(doc.text.slice(0, cap), "")}`);
+      if (doc.text.length > cap) console.log(dim(`\n[… ${doc.text.length} tegn totalt, bruk --tegn N]`));
+      console.log(dim(`\nhttps://lovdata.no/dokument/${doc.id}`));
     });
   },
 
@@ -337,13 +429,15 @@ const commands = {
   },
 
   status(_args, flags) {
+    const ltProblem = lovtidendProblem();
+    const lt = ltProblem ? undefined : new Lovtidend().status();
     const problem = indexProblem();
     if (problem) return console.log(`${problem} Kjør «lovdata sync».`);
     const corpus = new Corpus();
     const s = corpus.status();
     const fa = corpus.casesStatus();
     const days = s.syncedAt ? (Date.now() - Date.parse(s.syncedAt)) / 86400000 : undefined;
-    out(flags, { ...s, forarbeider: fa }, () => {
+    out(flags, { ...s, forarbeider: fa, lovtidend: lt ?? { problem: ltProblem } }, () => {
       console.log(bold("Lovdata-indeks") + dim(` ${dbPath()}`));
       console.log(
         `  hentet      ${s.syncedAt?.slice(0, 16).replace("T", " ")} ${dim(days === undefined ? "" : `(${days.toFixed(1)} døgn)`)}`,
@@ -352,20 +446,33 @@ const commands = {
       console.log(`  paragrafer  ${s.articles}`);
       for (const [k, v] of Object.entries(s.byType)) console.log(`    ${k.padEnd(16)} ${v}`);
       console.log(`  forarbeider ${fa.cases} saker ${dim(`${fa.fraSesjon} -> ${fa.tilSesjon}`)}`);
+      console.log(
+        `  lovtidend   ${lt ? `${lt.count} kunngjøringer ${dim(lt.years)}` : dim(ltProblem)}`,
+      );
+      if (lt && !lt.history) console.log(dim("              bare inneværende år — «lovdata sync --historikk» henter 2001 og framover"));
       if (days > 7) console.log(dim("\n  Indeksen er over en uke gammel — «lovdata sync» henter ferske data."));
     });
   },
 
-  async sync() {
-    const { sync, syncStortinget } = await import("./corpus.js");
+  async sync(_args, flags) {
+    const { sync, syncStortinget, syncLovtidend } = await import("./corpus.js");
     await sync({ log: (m) => console.log(m) });
     await syncStortinget({ log: (m) => console.log(m) });
+    try {
+      await syncLovtidend({ log: (m) => console.log(m), history: flags.historikk ? true : undefined });
+    } catch (err) {
+      // Lovtidend har sin egen fil; lovindeksen er ferdig og uskadd.
+      console.error(`lovdata: Lovtidend ble ikke oppdatert: ${err.message}`);
+    }
   },
 };
 
 const ALIASES = {
   søk: "sok",
   s: "sok",
+  lovtidend: "lt",
+  kunngjoring: "kg",
+  kunngjøring: "kg",
   paragraf: "p",
   forarbeid: "fa",
   forarbeider: "fa",

@@ -245,6 +245,52 @@ function decompress(archive) {
 }
 
 /**
+ * Skriving til Lovtidend-indeksen, samlet ett sted: én kunngjøring inn, og
+ * sletting av det en ny datapakke erstatter. Testene bruker den samme veien
+ * inn i indeksen som synken gjør.
+ */
+export function gazetteWriter(db) {
+  const insDoc = db.prepare(`INSERT INTO gazette
+    (id, refid, legacy_id, type, year, title, short_title, ministry, agency, published,
+     published_date, in_force, in_force_date, journal_number, misc, legal_areas)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const insText = db.prepare("INSERT INTO gazette_text(gazette, text) VALUES (?,?)");
+  const insFts = db.prepare("INSERT INTO gazette_fts(rowid, title, short_title, misc, text) VALUES (?,?,?,?,?)");
+  const insLink = db.prepare("INSERT INTO gazette_links(gazette, kind, target, article) VALUES (?,?,?,?)");
+  const existing = db.prepare("SELECT rowid FROM gazette WHERE id = ?");
+
+  const drop = (where, ...args) => {
+    for (const sql of [
+      `DELETE FROM gazette_fts WHERE rowid IN (SELECT rowid FROM gazette WHERE ${where})`,
+      `DELETE FROM gazette_text WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
+      `DELETE FROM gazette_links WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
+      `DELETE FROM gazette WHERE ${where}`,
+    ]) db.prepare(sql).run(...args);
+  };
+
+  const add = (doc, year) => {
+    // Samme kunngjøring to ganger i én pakke ville ellers brutt på id.
+    if (existing.get(doc.id)) drop("id = ?", doc.id);
+    const { lastInsertRowid: row } = insDoc.run(
+      doc.id, doc.refid ?? null, doc.legacyId ?? null, doc.type ?? null, year ?? null,
+      doc.title ?? null, doc.shortTitle ?? null, doc.ministry ?? null, doc.agency ?? null,
+      doc.published ?? null, doc.publishedDate ?? null, doc.inForce ?? null, doc.inForceDate ?? null,
+      doc.journalNumber ?? null, doc.misc ?? null, doc.legalAreas ?? null,
+    );
+    insText.run(row, packText(doc.text ?? ""));
+    insFts.run(row, doc.title ?? "", doc.shortTitle ?? "", doc.misc ?? "", doc.text ?? "");
+    for (const p of doc.parts ?? []) insLink.run(row, "endrer", p.target, p.article);
+    for (const ref of doc.basedOn ?? []) {
+      const m = ref.match(/^((?:lov|forskrift)\/[^/]+)(?:\/(§[^/]+))?/);
+      if (m) insLink.run(row, "hjemmel", m[1], m[2] ?? null);
+    }
+    return row;
+  };
+
+  return { add, drop };
+}
+
+/**
  * Norsk Lovtidend avd. I. Hver pakke erstatter årgangene den dekker, i én
  * transaksjon, og hoppes over når Lovdata ikke har endret den siden sist.
  *
@@ -266,22 +312,7 @@ export async function syncLovtidend({ log = () => {}, history, force = false } =
     const wantHistory = history ?? getMeta(db, "history") === "1";
     const chosen = packages.filter((p) => !p.history || wantHistory);
 
-    const insDoc = db.prepare(`INSERT INTO gazette
-      (id, refid, legacy_id, type, year, title, short_title, ministry, agency, published,
-       published_date, in_force, in_force_date, journal_number, misc, legal_areas)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    const insText = db.prepare("INSERT INTO gazette_text(gazette, text) VALUES (?,?)");
-    const insFts = db.prepare("INSERT INTO gazette_fts(rowid, title, short_title, misc, text) VALUES (?,?,?,?,?)");
-    const insLink = db.prepare("INSERT INTO gazette_links(gazette, kind, target, article) VALUES (?,?,?,?)");
-    const existing = db.prepare("SELECT rowid FROM gazette WHERE id = ?");
-    const drop = (where, ...args) => {
-      for (const sql of [
-        `DELETE FROM gazette_fts WHERE rowid IN (SELECT rowid FROM gazette WHERE ${where})`,
-        `DELETE FROM gazette_text WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
-        `DELETE FROM gazette_links WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
-        `DELETE FROM gazette WHERE ${where}`,
-      ]) db.prepare(sql).run(...args);
-    };
+    const { add, drop } = gazetteWriter(db);
 
     for (const pkg of chosen) {
       const key = `package:${pkg.filename}`;
@@ -317,21 +348,7 @@ export async function syncLovtidend({ log = () => {}, history, force = false } =
             continue;
           }
           // Årgangen er mappa i arkivet; det er den neste pakke erstatter.
-          const year = Number(name.match(/(?:^|\/)(\d{4})\//)?.[1]) || doc.year;
-          if (existing.get(doc.id)) drop("id = ?", doc.id);
-          const { lastInsertRowid: row } = insDoc.run(
-            doc.id, doc.refid ?? null, doc.legacyId ?? null, doc.type ?? null, year ?? null,
-            doc.title ?? null, doc.shortTitle ?? null, doc.ministry ?? null, doc.agency ?? null,
-            doc.published ?? null, doc.publishedDate ?? null, doc.inForce ?? null, doc.inForceDate ?? null,
-            doc.journalNumber ?? null, doc.misc ?? null, doc.legalAreas ?? null,
-          );
-          insText.run(row, packText(doc.text));
-          insFts.run(row, doc.title ?? "", doc.shortTitle ?? "", doc.misc ?? "", doc.text);
-          for (const p of doc.parts) insLink.run(row, "endrer", p.target, p.article);
-          for (const ref of doc.basedOn) {
-            const m = ref.match(/^((?:lov|forskrift)\/[^/]+)(?:\/(§[^/]+))?/);
-            if (m) insLink.run(row, "hjemmel", m[1], m[2] ?? null);
-          }
+          add(doc, Number(name.match(/(?:^|\/)(\d{4})\//)?.[1]) || doc.year);
           documents++;
           if (documents % 5000 === 0) log(`  ${documents} kunngjøringer …`);
         }
