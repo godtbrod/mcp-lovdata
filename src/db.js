@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -64,14 +65,87 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 `;
 
 export function openDb({ create = false } = {}) {
-  const path = dbPath();
+  return open(dbPath(), SCHEMA, create);
+}
+
+function open(path, schema, create) {
   if (create) mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { readOnly: !create, allowExtension: false });
   if (create) {
     db.exec("PRAGMA journal_mode = WAL");
-    db.exec(SCHEMA);
+    db.exec(schema);
   }
   return db;
+}
+
+/**
+ * Lovtidend ligger i en egen fil ved siden av lovindeksen. Historikken er
+ * flere hundre MB, og lovsynken avslutter med VACUUM — som skriver hele fila
+ * på nytt. Med Lovtidend i samme fil ville hver lovsync blitt tregere, og en
+ * Lovtidend-sync som feiler kan aldri skade lovindeksen når den ikke rører fila.
+ */
+export function lovtidendPath() {
+  return process.env.LOVTIDEND_DB || join(dirname(dbPath()), "lovtidend.db");
+}
+
+const LOVTIDEND_SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Én rad per kunngjøring. year er årgangen i arkivet (lti/2024/…), og det er
+-- den en ny datapakke erstatter.
+CREATE TABLE IF NOT EXISTS gazette (
+  rowid INTEGER PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE, refid TEXT, legacy_id TEXT, type TEXT, year INTEGER,
+  title TEXT, short_title TEXT, ministry TEXT, agency TEXT,
+  published TEXT, published_date TEXT, in_force TEXT, in_force_date TEXT,
+  journal_number TEXT, misc TEXT, legal_areas TEXT
+);
+CREATE INDEX IF NOT EXISTS gazette_year ON gazette(year);
+CREATE INDEX IF NOT EXISTS gazette_published ON gazette(published_date);
+CREATE INDEX IF NOT EXISTS gazette_refid ON gazette(refid);
+CREATE INDEX IF NOT EXISTS gazette_legacy ON gazette(legacy_id);
+
+-- Teksten deflate-komprimert, i sin egen tabell. Alle årgangene er 260 MB som
+-- klartekst og 86 MB slik — på en kontormaskin er det forskjellen på en halv
+-- gigabyte og ikke. At den ligger utenfor gazette gjør at et filtrert søk kan
+-- lese gjennom kunngjøringene uten å dra med seg teksten i dem.
+CREATE TABLE IF NOT EXISTS gazette_text (gazette INTEGER PRIMARY KEY, text BLOB);
+
+-- Hva kunngjøringen endrer (kind 'endrer') og hjemler den bygger på ('hjemmel').
+-- article er null for dokumentet som helhet, ellers «§15-6».
+CREATE TABLE IF NOT EXISTS gazette_links (
+  gazette INTEGER NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL, article TEXT
+);
+CREATE INDEX IF NOT EXISTS gazette_links_target ON gazette_links(kind, target, article);
+CREATE INDEX IF NOT EXISTS gazette_links_gazette ON gazette_links(gazette);
+
+-- content='' lagrer bare søkeindeksen, ikke teksten en gang til — den ligger
+-- komprimert i gazette. contentless_delete lar en årgang slettes med DELETE.
+-- Prisen er at snippet() ikke virker; utdragene lages i stedet av makeSnippet.
+CREATE VIRTUAL TABLE IF NOT EXISTS gazette_fts USING fts5(
+  title, short_title, misc, text,
+  content='', contentless_delete=1,
+  tokenize="unicode61 remove_diacritics 0"
+);
+`;
+
+export function openLovtidendDb({ create = false } = {}) {
+  return open(lovtidendPath(), LOVTIDEND_SCHEMA, create);
+}
+
+/** Som indexProblem, for Lovtidend. Null når minst én årgang er hentet. */
+export function lovtidendProblem() {
+  const path = lovtidendPath();
+  if (!existsSync(path)) return "Lovtidend er ikke hentet ennå.";
+  let db;
+  try {
+    db = openLovtidendDb();
+    return getMeta(db, "synced_at") ? null : "Lovtidend ble aldri ferdig hentet — en sync stoppet underveis.";
+  } catch (err) {
+    return `Lovtidend-indeksen i ${path} kan ikke leses: ${err.message}`;
+  } finally {
+    db?.close();
+  }
 }
 
 export function getMeta(db, key) {
@@ -156,4 +230,29 @@ export function toMatchQuery(input) {
     return bare.length >= MIN_PREFIKS ? `"${bare}"*` : `"${bare}"`;
   });
   return [...phrases, ...quoted].join(" ");
+}
+
+/**
+ * Ordene søket faktisk leter etter, lest ut av MATCH-uttrykket — da er de
+ * alltid de samme som FTS5 brukte. Brukes til å markere treffene i utdrag der
+ * snippet() ikke kan brukes, altså i Lovtidend.
+ */
+export function queryTerms(input) {
+  const out = [];
+  for (const m of toMatchQuery(input).matchAll(/"([^"]*)"(\*)?/g)) {
+    const words = m[1].split(/\s+/).filter(Boolean);
+    // Stjerna gjelder bare det siste ordet i en frase.
+    words.forEach((word, i) => out.push({ word, prefix: Boolean(m[2]) && i === words.length - 1 }));
+  }
+  return out;
+}
+
+/** Lovtidend-teksten lagres komprimert; se skjemaet. */
+export function packText(text) {
+  return deflateRawSync(Buffer.from(text ?? "", "utf8"), { level: 6 });
+}
+
+export function unpackText(blob) {
+  if (blob == null) return "";
+  return typeof blob === "string" ? blob : inflateRawSync(blob).toString("utf8");
 }

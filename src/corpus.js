@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -7,9 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { getMeta, openDb, setMeta } from "./db.js";
+import { getMeta, openDb, openLovtidendDb, packText, setMeta } from "./db.js";
 import { fetchCases, fetchSessions } from "./stortinget.js";
 import { parseDocument } from "./parse.js";
+import { parseGazette } from "./lovtidend.js";
 
 const run = promisify(execFile);
 
@@ -127,6 +128,243 @@ export async function sync({ log = () => {}, datasets = DATASETS } = {}) {
   } catch (err) {
     try { db.exec("ROLLBACK"); } catch { /* transaksjonen var ikke åpen */ }
     throw err;
+  } finally {
+    db.close();
+    await rm(work, { recursive: true, force: true });
+  }
+}
+
+// ------------------------------------------------------------- Lovtidend
+
+const PUBLIC_DATA = "https://api.lovdata.no/v1/publicData";
+
+/**
+ * Lovtidend-pakkene i Lovdatas liste. Filnavnene endrer seg ved årsskiftet —
+ * «lovtidend-avd1-2026» blir en del av «lovtidend-avd1-2001-2026», og en ny
+ * «lovtidend-avd1-2027» dukker opp — så de leses fra lista, ikke hardkodes.
+ */
+export function lovtidendPackages(list) {
+  return list
+    .map((p) => {
+      const m = /^lovtidend-avd1-(\d{4})(?:-(\d{4}))?\.tar\.bz2$/.exec(p.filename ?? "");
+      if (!m) return undefined;
+      return {
+        filename: p.filename,
+        from: Number(m[1]),
+        to: Number(m[2] ?? m[1]),
+        history: Boolean(m[2]),
+        lastModified: p.lastModified,
+        bytes: Number(p.sizeBytes) || undefined,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.from - b.from);
+}
+
+/**
+ * Leser en ukomprimert tar-strøm og gir filene én og én, uten å skrive noe
+ * til disk. Historikken er 38 000 filer og nesten 700 MB utpakket; å legge dem
+ * på disk og lese dem inn igjen tok dobbelt så lang tid på Windows.
+ */
+export async function* tarEntries(stream) {
+  const chunks = [];
+  let have = 0;
+  const take = (n) => {
+    const all = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, have);
+    chunks.length = 0;
+    const out = all.subarray(0, n);
+    if (all.length > n) chunks.push(all.subarray(n));
+    have -= n;
+    return out;
+  };
+  const cstr = (buf, start, len) => {
+    const end = buf.indexOf(0, start);
+    return buf.toString("utf8", start, end === -1 || end > start + len ? start + len : end);
+  };
+  let longName;
+  let need = 512;
+  let header;
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+    have += chunk.length;
+    while (have >= need) {
+      if (!header) {
+        header = take(512);
+        if (header.every((b) => b === 0)) {
+          header = undefined;
+          continue;
+        }
+        const size = parseInt(cstr(header, 124, 12).trim() || "0", 8);
+        header = { block: header, size };
+        need = Math.ceil(size / 512) * 512;
+        continue;
+      }
+      const { block, size } = header;
+      const body = take(need).subarray(0, size);
+      header = undefined;
+      need = 512;
+      const type = String.fromCharCode(block[156]);
+      if (type === "L") {
+        longName = cstr(body, 0, body.length);
+      } else if (type === "x") {
+        // pax-hode: «30 path=lti/2026/…\n». bsdtar skriver det bare ved behov.
+        longName = /(?:^|\n)\d+ path=([^\n]*)/.exec(body.toString("utf8"))?.[1] ?? longName;
+      } else if (type === "0" || type === "\0") {
+        const prefix = cstr(block, 345, 155);
+        const name = longName ?? (prefix ? `${prefix}/${cstr(block, 0, 100)}` : cstr(block, 0, 100));
+        longName = undefined;
+        yield { name, data: body };
+      } else {
+        longName = undefined;
+      }
+    }
+  }
+}
+
+/**
+ * Tar-strømmen ut av et .tar.bz2-arkiv. Windows har ingen bzip2, men bsdtar
+ * kan skrive arkivet om til ukomprimert tar på stdout («@arkiv»). Andre
+ * steder er bzip2 alltid til stede — GNU tar bruker den selv til xjf.
+ */
+function decompress(archive) {
+  const child =
+    process.platform === "win32"
+      ? spawn(TAR, ["-cf", "-", `@${archive}`], { stdio: ["ignore", "pipe", "pipe"] })
+      : spawn("bzip2", ["-dc", archive], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d));
+  const exited = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`utpakking feilet (kode ${code}): ${stderr.trim().slice(0, 300)}`)),
+    );
+  });
+  // Uten en fangst her blir en feil før noen venter på den en uhåndtert rejection.
+  exited.catch(() => {});
+  return { stream: child.stdout, exited, kill: () => child.kill() };
+}
+
+/**
+ * Norsk Lovtidend avd. I. Hver pakke erstatter årgangene den dekker, i én
+ * transaksjon, og hoppes over når Lovdata ikke har endret den siden sist.
+ *
+ * `history`: true henter også 2001–(i fjor), false aldri. Uten verdi friskes
+ * historikken opp bare hvis den er hentet før — den som har valgt den, beholder
+ * den oppdatert, uten at alle andre må laste ned 70 MB.
+ */
+export async function syncLovtidend({ log = () => {}, history, force = false } = {}) {
+  const started = Date.now();
+  const res = await fetch(`${PUBLIC_DATA}/list`, { headers: { "User-Agent": "mcp-lovdata" } });
+  if (!res.ok) throw new Error(`${PUBLIC_DATA}/list: HTTP ${res.status}`);
+  const packages = lovtidendPackages(await res.json());
+  if (!packages.length) throw new Error("Fant ingen Lovtidend-pakker i Lovdatas liste.");
+
+  const db = openLovtidendDb({ create: true });
+  const work = await mkdtemp(join(tmpdir(), "lovtidend-"));
+  const result = { hentet: [], uendret: [] };
+  try {
+    const wantHistory = history ?? getMeta(db, "history") === "1";
+    const chosen = packages.filter((p) => !p.history || wantHistory);
+
+    const insDoc = db.prepare(`INSERT INTO gazette
+      (id, refid, legacy_id, type, year, title, short_title, ministry, agency, published,
+       published_date, in_force, in_force_date, journal_number, misc, legal_areas)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insText = db.prepare("INSERT INTO gazette_text(gazette, text) VALUES (?,?)");
+    const insFts = db.prepare("INSERT INTO gazette_fts(rowid, title, short_title, misc, text) VALUES (?,?,?,?,?)");
+    const insLink = db.prepare("INSERT INTO gazette_links(gazette, kind, target, article) VALUES (?,?,?,?)");
+    const existing = db.prepare("SELECT rowid FROM gazette WHERE id = ?");
+    const drop = (where, ...args) => {
+      for (const sql of [
+        `DELETE FROM gazette_fts WHERE rowid IN (SELECT rowid FROM gazette WHERE ${where})`,
+        `DELETE FROM gazette_text WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
+        `DELETE FROM gazette_links WHERE gazette IN (SELECT rowid FROM gazette WHERE ${where})`,
+        `DELETE FROM gazette WHERE ${where}`,
+      ]) db.prepare(sql).run(...args);
+    };
+
+    for (const pkg of chosen) {
+      const key = `package:${pkg.filename}`;
+      if (!force && getMeta(db, key) === pkg.lastModified) {
+        log(`Lovtidend ${pkg.from}${pkg.history ? `–${pkg.to}` : ""}: uendret siden sist`);
+        result.uendret.push(pkg.filename);
+        continue;
+      }
+      const archive = join(work, pkg.filename);
+      log(`laster ned Lovtidend ${pkg.from}${pkg.history ? `–${pkg.to}` : ""} …`);
+      const dl = await fetch(`${PUBLIC_DATA}/get/${pkg.filename}`, { headers: { "User-Agent": "mcp-lovdata" } });
+      if (!dl.ok) throw new Error(`${pkg.filename}: HTTP ${dl.status}`);
+      await pipeline(Readable.fromWeb(dl.body), createWriteStream(archive));
+      log(`leser ${((await stat(archive)).size / 1e6).toFixed(1)} MB …`);
+
+      const tar = decompress(archive);
+      let documents = 0;
+      let skipped = 0;
+      db.exec("BEGIN");
+      try {
+        drop("year BETWEEN ? AND ?", pkg.from, pkg.to);
+        for await (const { name, data } of tarEntries(tar.stream)) {
+          if (!name.endsWith(".xml")) continue;
+          let doc;
+          try {
+            doc = parseGazette(data.toString("utf8"));
+          } catch {
+            skipped++;
+            continue;
+          }
+          if (!doc.id) {
+            skipped++;
+            continue;
+          }
+          // Årgangen er mappa i arkivet; det er den neste pakke erstatter.
+          const year = Number(name.match(/(?:^|\/)(\d{4})\//)?.[1]) || doc.year;
+          if (existing.get(doc.id)) drop("id = ?", doc.id);
+          const { lastInsertRowid: row } = insDoc.run(
+            doc.id, doc.refid ?? null, doc.legacyId ?? null, doc.type ?? null, year ?? null,
+            doc.title ?? null, doc.shortTitle ?? null, doc.ministry ?? null, doc.agency ?? null,
+            doc.published ?? null, doc.publishedDate ?? null, doc.inForce ?? null, doc.inForceDate ?? null,
+            doc.journalNumber ?? null, doc.misc ?? null, doc.legalAreas ?? null,
+          );
+          insText.run(row, packText(doc.text));
+          insFts.run(row, doc.title ?? "", doc.shortTitle ?? "", doc.misc ?? "", doc.text);
+          for (const p of doc.parts) insLink.run(row, "endrer", p.target, p.article);
+          for (const ref of doc.basedOn) {
+            const m = ref.match(/^((?:lov|forskrift)\/[^/]+)(?:\/(§[^/]+))?/);
+            if (m) insLink.run(row, "hjemmel", m[1], m[2] ?? null);
+          }
+          documents++;
+          if (documents % 5000 === 0) log(`  ${documents} kunngjøringer …`);
+        }
+        await tar.exited;
+        setMeta(db, key, pkg.lastModified);
+        if (pkg.history) setMeta(db, "history", "1");
+        setMeta(db, "synced_at", new Date().toISOString());
+        db.exec("COMMIT");
+      } catch (err) {
+        tar.kill();
+        try { db.exec("ROLLBACK"); } catch { /* transaksjonen var ikke åpen */ }
+        throw err;
+      }
+      await rm(archive, { force: true });
+      log(`  ${documents} kunngjøringer fra ${pkg.from}${pkg.history ? `–${pkg.to}` : ""}`);
+      result.hentet.push({ pakke: pkg.filename, kunngjøringer: documents, hoppetOver: skipped || undefined });
+    }
+
+    if (result.hentet.length) {
+      db.exec("INSERT INTO gazette_fts(gazette_fts) VALUES('optimize')");
+      // Uten statistikk gjettet planleggeren feil og leste seg gjennom hele
+      // lenketabellen på oppslag som skulle tatt mikrosekunder.
+      db.exec("ANALYZE");
+      // WAL-fila vokser til størrelsen på det som ble skrevet og blir liggende
+      // til noen sjekkpunkter den. Det gjør vi med en gang.
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    const row = db.prepare("SELECT COUNT(*) n, MIN(year) a, MAX(year) b FROM gazette").get();
+    result.kunngjøringer = row.n;
+    result.årganger = row.n ? `${row.a}–${row.b}` : undefined;
+    result.sekunder = Number(((Date.now() - started) / 1000).toFixed(1));
+    log(`Lovtidend: ${row.n} kunngjøringer (${result.årganger ?? "ingen"}) på ${result.sekunder} s`);
+    return result;
   } finally {
     db.close();
     await rm(work, { recursive: true, force: true });

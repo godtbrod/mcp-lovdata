@@ -10,6 +10,9 @@ export async function withClient(fn) {
     command: process.execPath,
     args: [join(root, "src/index.js")],
     stderr: "pipe",
+    // SDK-en gir barneprosessen et vasket miljø uten LOVDATA_DB, og da ville
+    // testene lest brukerens egen indeks i stedet for den i testmappa.
+    env: { ...process.env },
   });
   const client = new Client({ name: "test", version: "0.0.0" });
   await client.connect(transport);

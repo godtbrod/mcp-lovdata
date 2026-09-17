@@ -1,4 +1,5 @@
-import { openDb, getMeta, toMatchQuery } from "./db.js";
+import { getMeta, openDb, openLovtidendDb, queryTerms, toMatchQuery, unpackText } from "./db.js";
+import { compareArticles, toRefid } from "./lovtidend.js";
 
 /** Lovdatas datofelter kan inneholde fritekst; dette skiller ut ekte ISO-datoer. */
 const ISO_DATE = (col) => `${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'`;
@@ -111,6 +112,11 @@ export class Corpus {
 
   document(docId) {
     return this.db.prepare("SELECT * FROM documents WHERE id = ?").get(docId);
+  }
+
+  /** Oppslag på den gamle koden («LOV-2005-06-17-62») — det Lovtidend lenker med. */
+  byLegacy(code) {
+    return code ? this.db.prepare("SELECT * FROM documents WHERE legacy_id = ? LIMIT 1").get(code) : undefined;
   }
 
   articles(docId) {
@@ -231,6 +237,202 @@ export class Corpus {
   casesStatus() {
     const row = this.db.prepare("SELECT COUNT(*) n, MIN(session) a, MAX(session) b FROM cases").get();
     return { cases: row.n, fraSesjon: row.a, tilSesjon: row.b };
+  }
+
+  close() {
+    this.db.close();
+  }
+}
+
+// ------------------------------------------------------------- Lovtidend
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Utdrag med søkeordene markert. FTS5-tabellen for Lovtidend er contentless
+ * (teksten ligger komprimert i gazette), og da gir snippet() bare null.
+ *
+ * Vinduet legges der flest forskjellige søkeord står nær hverandre — i en
+ * kunngjøring på 40 000 tegn er det forskjellen på å se selve endringen og å
+ * se innledningen.
+ */
+export function makeSnippet(text, terms, { width = 260 } = {}) {
+  const clean = (text ?? "").replace(/\s+/g, " ").trim();
+  const short = (from) =>
+    (from > 0 ? "… " : "") + clean.slice(from, from + width).trim() + (from + width < clean.length ? " …" : "");
+  if (!terms.length || !clean) return short(0);
+
+  const hits = [];
+  terms.forEach((t, i) => {
+    const re = new RegExp(
+      `(?<![\\p{L}\\p{N}])${escapeRe(t.word)}${t.prefix ? "[\\p{L}\\p{N}]*" : ""}(?![\\p{L}\\p{N}])`,
+      "giu",
+    );
+    let m;
+    let n = 0;
+    while ((m = re.exec(clean)) && n++ < 50) hits.push({ term: i, start: m.index, end: m.index + m[0].length });
+  });
+  if (!hits.length) return short(0);
+  hits.sort((a, b) => a.start - b.start);
+
+  let best = { score: -1, from: 0 };
+  for (const [i, hit] of hits.entries()) {
+    const seen = new Set();
+    for (let j = i; j < hits.length && hits[j].end <= hit.start + width; j++) seen.add(hits[j].term);
+    if (seen.size > best.score) best = { score: seen.size, from: Math.max(0, hit.start - 40) };
+  }
+
+  const to = Math.min(clean.length, best.from + width);
+  let out = "";
+  let at = best.from;
+  for (const hit of hits) {
+    if (hit.start < at || hit.end > to) continue;
+    out += `${clean.slice(at, hit.start)}«${clean.slice(hit.start, hit.end)}»`;
+    at = hit.end;
+  }
+  out += clean.slice(at, to);
+  return (best.from > 0 ? "… " : "") + out.trim() + (to < clean.length ? " …" : "");
+}
+
+const LTI_ORDER = "CASE g.type WHEN 'lov' THEN 0 ELSE 1 END";
+
+/** Norsk Lovtidend avd. I — kunngjøringene. Egen fil, se lovtidendPath. */
+export class Lovtidend {
+  constructor() {
+    this.db = openLovtidendDb();
+  }
+
+  status() {
+    const row = this.db.prepare("SELECT COUNT(*) n, MIN(year) a, MAX(year) b FROM gazette").get();
+    const types = this.db.prepare("SELECT type, COUNT(*) n FROM gazette GROUP BY type ORDER BY n DESC").all();
+    return {
+      syncedAt: getMeta(this.db, "synced_at"),
+      count: row.n,
+      years: row.n ? `${row.a}–${row.b}` : undefined,
+      history: getMeta(this.db, "history") === "1",
+      byType: Object.fromEntries(types.map((t) => [t.type, t.n])),
+    };
+  }
+
+  /**
+   * Søk i kunngjøringene. Uten `query` er det en ren liste, sortert med de
+   * sist kunngjorte først; med `query` sorteres det etter relevans.
+   */
+  search({ query, type, ministry, endrer, article, hjemmel, from, to, inForceFrom, inForceTo, limit = 10, offset = 0 }) {
+    const where = [];
+    const filters = {};
+    let fts = "";
+    if (query) {
+      const match = toMatchQuery(query);
+      if (!match) return { total: 0, hits: [] };
+      fts = "JOIN gazette_fts f ON f.rowid = g.rowid";
+      where.push("gazette_fts MATCH :match");
+      filters.match = match;
+    }
+    if (type) { where.push("g.type = :type"); filters.type = type; }
+    if (ministry) { where.push("(g.ministry LIKE :ministry OR g.agency LIKE :ministry)"); filters.ministry = `%${ministry}%`; }
+    if (from) { where.push("g.published_date >= :from"); filters.from = from; }
+    if (to) { where.push("g.published_date <= :to"); filters.to = to; }
+    if (inForceFrom) { where.push("g.in_force_date >= :inForceFrom"); filters.inForceFrom = inForceFrom; }
+    if (inForceTo) { where.push("g.in_force_date <= :inForceTo"); filters.inForceTo = inForceTo; }
+    // IN, ikke EXISTS: med EXISTS leste planleggeren seg gjennom alle
+    // kunngjøringene og slo opp lenkene for hver. IN slår opp lenkene først.
+    if (endrer) {
+      where.push(`g.rowid IN (SELECT l.gazette FROM gazette_links l
+                  WHERE l.kind = 'endrer' AND l.target = :endrer${article ? " AND l.article = :article" : ""})`);
+      filters.endrer = endrer;
+      if (article) filters.article = article;
+    }
+    if (hjemmel) {
+      where.push("g.rowid IN (SELECT l.gazette FROM gazette_links l WHERE l.kind = 'hjemmel' AND l.target = :hjemmel)");
+      filters.hjemmel = hjemmel;
+    }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const total = this.db.prepare(`SELECT COUNT(*) n FROM gazette g ${fts} ${clause}`).get(filters).n;
+    const order = query
+      ? `${LTI_ORDER}, bm25(gazette_fts, 8.0, 4.0, 2.0, 1.0)`
+      : "g.published_date DESC, g.id DESC";
+    const rows = this.db
+      .prepare(`SELECT g.rowid, g.id, g.refid, g.legacy_id, g.type, g.year, g.title, g.short_title,
+                       g.ministry, g.agency, g.published, g.published_date, g.in_force, g.in_force_date, g.misc
+                FROM gazette g ${fts} ${clause} ORDER BY ${order} LIMIT :limit OFFSET :offset`)
+      .all({ ...filters, limit, offset });
+    const terms = query ? queryTerms(query) : [];
+    const hits = rows.map((r) => ({
+      ...r,
+      snippet: makeSnippet(this.text(r.rowid), terms),
+      changes: this.links(r.rowid, "endrer"),
+    }));
+    return { total, hits };
+  }
+
+  text(rowid) {
+    return unpackText(this.db.prepare("SELECT text FROM gazette_text WHERE gazette = ?").get(rowid)?.text);
+  }
+
+  /**
+   * Sorteringen gjøres i JS med vilje: med ORDER BY i spørringen valgte
+   * planleggeren indeksen på (kind, target) for å slippe å sortere, og leste
+   * seg gjennom alle 150 000 endringslenkene i stedet for de ti på denne raden.
+   */
+  links(rowid, kind) {
+    return this.db
+      .prepare("SELECT target, article FROM gazette_links WHERE gazette = ? AND kind = ?")
+      .all(rowid, kind)
+      .sort((a, b) => a.target.localeCompare(b.target) || compareArticles(a.article, b.article));
+  }
+
+  /**
+   * Slå opp én kunngjøring på dokid, LOV-/FOR-kode eller refid. Formene
+   * normaliseres først; lower() i spørringen ville gjort indeksene ubrukelige.
+   */
+  get(reference) {
+    const ref = reference.trim();
+    const refid = toRefid(ref) ?? ref.toLowerCase();
+    const row = this.db
+      .prepare("SELECT * FROM gazette WHERE id = :id OR legacy_id = :legacy OR refid = :refid LIMIT 1")
+      .get({ id: `LTI/${refid}`, legacy: ref.toUpperCase(), refid });
+    if (!row) return undefined;
+    return {
+      ...row,
+      text: this.text(row.rowid),
+      changes: this.links(row.rowid, "endrer"),
+      basedOn: this.links(row.rowid, "hjemmel"),
+      inForceBy: this.inForceBy(row.refid),
+    };
+  }
+
+  /**
+   * Endringslover står ofte med «Kongen bestemmer» som ikrafttredelse. Datoen
+   * kommer siden i en egen kunngjøring — en kgl.res. med loven som hjemmel.
+   */
+  inForceBy(refid) {
+    if (!refid) return [];
+    return this.db
+      .prepare(`SELECT g.id, g.legacy_id, g.title, g.in_force, g.in_force_date, g.published_date
+                FROM gazette g JOIN gazette_links l ON l.gazette = g.rowid
+                WHERE l.kind = 'hjemmel' AND l.target = ? AND g.title LIKE 'Ikraftsetting%'
+                ORDER BY g.published_date`)
+      .all(refid);
+  }
+
+  /** Alle kunngjøringer som endrer dette dokumentet, eldst først. */
+  changesTo({ target, article, limit = 50, offset = 0 }) {
+    const filters = { target, limit, offset };
+    const clause = article ? "AND l.article = :article" : "";
+    if (article) filters.article = article;
+    const total = this.db
+      .prepare(`SELECT COUNT(DISTINCT l.gazette) n FROM gazette_links l
+                WHERE l.kind = 'endrer' AND l.target = :target ${clause}`)
+      .get(article ? { target, article } : { target }).n;
+    const rows = this.db
+      .prepare(`SELECT DISTINCT g.rowid, g.id, g.legacy_id, g.title, g.short_title, g.type,
+                       g.published_date, g.in_force, g.in_force_date, g.ministry
+                FROM gazette_links l JOIN gazette g ON g.rowid = l.gazette
+                WHERE l.kind = 'endrer' AND l.target = :target ${clause}
+                ORDER BY g.published_date DESC LIMIT :limit OFFSET :offset`)
+      .all(filters);
+    return { total, rows };
   }
 
   close() {
