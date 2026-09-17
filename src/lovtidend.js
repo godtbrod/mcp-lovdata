@@ -127,14 +127,14 @@ export function toLegacyId(refid) {
  * og sammenlignes som tekst mot kunngjøringsdatoen.
  */
 export function periodStart(value) {
-  const v = (value ?? "").trim();
+  const v = String(value ?? "").trim();
   if (/^\d{4}$/.test(v)) return `${v}-01-01`;
   if (/^\d{4}-\d{2}$/.test(v)) return `${v}-01`;
   return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
 }
 
 export function periodEnd(value) {
-  const v = (value ?? "").trim();
+  const v = String(value ?? "").trim();
   if (/^\d{4}$/.test(v)) return `${v}-12-31`;
   if (/^\d{4}-\d{2}$/.test(v)) {
     // Siste dag i måneden: dag 0 i neste måned.

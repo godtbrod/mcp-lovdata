@@ -232,7 +232,8 @@ function decompress(archive) {
       ? spawn(TAR, ["-cf", "-", `@${archive}`], { stdio: ["ignore", "pipe", "pipe"] })
       : spawn("bzip2", ["-dc", archive], { stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
-  child.stderr.on("data", (d) => (stderr += d));
+  // Med tak: en utpakker som klager på hver fil ville ellers fylt minnet.
+  child.stderr.on("data", (d) => { if (stderr.length < 4000) stderr += d; });
   const exited = new Promise((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code) =>
@@ -300,7 +301,10 @@ export function gazetteWriter(db) {
  */
 export async function syncLovtidend({ log = () => {}, history, force = false } = {}) {
   const started = Date.now();
-  const res = await fetch(`${PUBLIC_DATA}/list`, { headers: { "User-Agent": "mcp-lovdata" } });
+  const res = await fetch(`${PUBLIC_DATA}/list`, {
+    headers: { "User-Agent": "mcp-lovdata" },
+    signal: AbortSignal.timeout(30_000),
+  });
   if (!res.ok) throw new Error(`${PUBLIC_DATA}/list: HTTP ${res.status}`);
   const packages = lovtidendPackages(await res.json());
   if (!packages.length) throw new Error("Fant ingen Lovtidend-pakker i Lovdatas liste.");
@@ -353,6 +357,10 @@ export async function syncLovtidend({ log = () => {}, history, force = false } =
           if (documents % 5000 === 0) log(`  ${documents} kunngjøringer …`);
         }
         await tar.exited;
+        // En pakke som ikke ga én eneste kunngjøring har gått galt et sted.
+        // Uten denne sperren ville slettingen over blitt stående — og pakken
+        // ville blitt hoppet over som «uendret» ved neste sync.
+        if (!documents) throw new Error(`${pkg.filename} inneholdt ingen lesbare kunngjøringer`);
         setMeta(db, key, pkg.lastModified);
         if (pkg.history) setMeta(db, "history", "1");
         setMeta(db, "synced_at", new Date().toISOString());
