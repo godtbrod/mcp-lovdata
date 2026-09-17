@@ -360,10 +360,19 @@ export class Lovtidend {
     const terms = query ? queryTerms(query) : [];
     const hits = rows.map((r) => ({
       ...r,
-      snippet: makeSnippet(this.text(r.rowid), terms),
+      // Uten søkeord er det ingenting å markere, og teksten trenger ikke pakkes ut.
+      snippet: terms.length ? makeSnippet(this.text(r.rowid), terms) : undefined,
       changes: this.links(r.rowid, "endrer"),
     }));
     return { total, hits };
+  }
+
+  /** De vanligste departementsnavnene — til hjelp når et filter ikke traff. */
+  ministries(limit = 12) {
+    return this.db
+      .prepare("SELECT ministry, COUNT(*) n FROM gazette WHERE ministry IS NOT NULL GROUP BY ministry ORDER BY n DESC LIMIT ?")
+      .all(limit)
+      .map((r) => r.ministry);
   }
 
   text(rowid) {
