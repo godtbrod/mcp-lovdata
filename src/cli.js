@@ -87,6 +87,21 @@ function parseArgs(argv) {
 
 const num = (v, fallback) => (v === undefined ? fallback : Number(v));
 
+/** Et flagg uten verdi blir true; det er ingen tekst, og skal behandles som fravær. */
+const text = (v) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+
+/** Perioder må si fra når formen ikke forstås, ikke bare slå av filteret. */
+function period(value, parse, flag) {
+  const v = text(value);
+  if (v === undefined) return undefined;
+  const parsed = parse(v);
+  if (!parsed) {
+    console.error(`lovdata: ${flag} «${v}» forstås ikke. Skriv år, år-måned eller dato: 2024, 2024-03, 2024-03-01.`);
+    process.exit(1);
+  }
+  return parsed;
+}
+
 function requireIndex() {
   const problem = indexProblem();
   if (problem) {
@@ -239,15 +254,21 @@ const commands = {
 
   lt(args, flags) {
     const lovtidend = requireLovtidend();
-    const endrer = flags.endrer ? refidOf(flags.endrer) : undefined;
+    const query = args.join(" ") || undefined;
+    const endrer = text(flags.endrer) ? refidOf(flags.endrer) : undefined;
+    const paragraf = text(flags.paragraf);
+    if (paragraf && !endrer) {
+      console.error("lovdata: --paragraf må kombineres med --endrer — ellers vet vi ikke hvilken lovs paragraf det gjelder.");
+      process.exit(1);
+    }
     const { total, hits } = lovtidend.search({
-      query: args.join(" ") || undefined,
+      query,
       endrer,
-      article: flags.paragraf ? normalizeArticle(String(flags.paragraf)) : undefined,
-      type: flags.type,
-      ministry: flags.dep,
-      from: periodStart(flags.fra),
-      to: periodEnd(flags.til),
+      article: paragraf ? normalizeArticle(paragraf) : undefined,
+      type: text(flags.type),
+      ministry: text(flags.dep),
+      from: period(flags.fra, periodStart, "--fra"),
+      to: period(flags.til, periodEnd, "--til"),
       limit: num(flags.limit, 10),
     });
     out(flags, { total, hits }, () => {
@@ -267,7 +288,7 @@ const commands = {
         for (const [target, articles] of [...perDoc].slice(0, 4)) {
           console.log(`  ${dim(toLegacyId(target) ?? target)} ${cyan(articles.slice(0, 12).join(", "))}`);
         }
-        if (args.length) console.log(wrap(h.snippet.replace(/«([^»]*)»/g, (_, w) => c(33, w))));
+        if (h.snippet) console.log(wrap(h.snippet.replace(/«([^»]*)»/g, (_, w) => c(33, w))));
       }
     });
   },

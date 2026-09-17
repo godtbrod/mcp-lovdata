@@ -733,6 +733,8 @@ function describeLinks(links, names, { maxTargets = 12, maxArticles = 15 } = {})
 /** Enkelte kunngjøringstitler lister opp alle forskriftene de endrer. */
 const shorten = (s, max = 180) => (s && s.length > max ? `${s.slice(0, max).trimEnd()} …` : s);
 
+const PERIOD = z.string().regex(/^\d{4}(-\d{2}){0,2}$/, "Skriv år, år-måned eller år-måned-dag: 2024, 2024-03, 2024-03-01.").optional();
+
 const gazetteRef = (h) => ({
   id: h.id,
   kode: h.legacy_id ?? undefined,
@@ -781,10 +783,12 @@ server.registerTool(
         .describe('Bare kunngjøringer gitt med hjemmel i dette dokumentet, f.eks. "matloven".'),
       type: z.enum(["lov", "forskrift"]).optional(),
       ministry: z.string().optional().describe('Delstreng av departement eller etat, f.eks. "Landbruks".'),
-      from: z.string().optional().describe('Kunngjort fra og med, "2024", "2024-03" eller "2024-03-01".'),
-      to: z.string().optional().describe("Kunngjort til og med, samme former."),
-      inForceFrom: z.string().optional().describe("Trådte i kraft fra og med. Mange har ingen dato («Kongen bestemmer»)."),
-      inForceTo: z.string().optional().describe("Trådte i kraft til og med."),
+      // Formen valideres her: et datoformat verktøyet ikke forstår, ville
+      // ellers slått filteret stille av og gitt treff fra alle årganger.
+      from: PERIOD.describe('Kunngjort fra og med, "2024", "2024-03" eller "2024-03-01".'),
+      to: PERIOD.describe("Kunngjort til og med, samme former."),
+      inForceFrom: PERIOD.describe("Trådte i kraft fra og med. Mange har ingen dato («Kongen bestemmer»)."),
+      inForceTo: PERIOD.describe("Trådte i kraft til og med."),
       limit: z.number().int().min(1).max(50).default(10),
       offset: z.number().int().min(0).default(0),
     },

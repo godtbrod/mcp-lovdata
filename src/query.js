@@ -330,7 +330,11 @@ export class Lovtidend {
       filters.match = match;
     }
     if (type) { where.push("g.type = :type"); filters.type = type; }
-    if (ministry) { where.push("(g.ministry LIKE :ministry OR g.agency LIKE :ministry)"); filters.ministry = `%${ministry}%`; }
+    if (ministry) {
+      // % og _ fra brukeren er tegn i et departementsnavn, ikke jokertegn.
+      where.push(`(g.ministry LIKE :ministry ESCAPE '\\' OR g.agency LIKE :ministry ESCAPE '\\')`);
+      filters.ministry = `%${ministry.replace(/[\\%_]/g, "\\$&")}%`;
+    }
     if (from) { where.push("g.published_date >= :from"); filters.from = from; }
     if (to) { where.push("g.published_date <= :to"); filters.to = to; }
     if (inForceFrom) { where.push("g.in_force_date >= :inForceFrom"); filters.inForceFrom = inForceFrom; }
@@ -417,31 +421,14 @@ export class Lovtidend {
    */
   inForceBy(refid) {
     if (!refid) return [];
+    // DISTINCT: en kgl.res. med hjemmel i flere paragrafer i samme lov har én
+    // lenkerad per paragraf, og ville ellers kommet ut like mange ganger.
     return this.db
-      .prepare(`SELECT g.id, g.legacy_id, g.title, g.in_force, g.in_force_date, g.published_date
+      .prepare(`SELECT DISTINCT g.id, g.legacy_id, g.title, g.in_force, g.in_force_date, g.published_date
                 FROM gazette g JOIN gazette_links l ON l.gazette = g.rowid
                 WHERE l.kind = 'hjemmel' AND l.target = ? AND g.title LIKE 'Ikraftsetting%'
                 ORDER BY g.published_date`)
       .all(refid);
-  }
-
-  /** Alle kunngjøringer som endrer dette dokumentet, eldst først. */
-  changesTo({ target, article, limit = 50, offset = 0 }) {
-    const filters = { target, limit, offset };
-    const clause = article ? "AND l.article = :article" : "";
-    if (article) filters.article = article;
-    const total = this.db
-      .prepare(`SELECT COUNT(DISTINCT l.gazette) n FROM gazette_links l
-                WHERE l.kind = 'endrer' AND l.target = :target ${clause}`)
-      .get(article ? { target, article } : { target }).n;
-    const rows = this.db
-      .prepare(`SELECT DISTINCT g.rowid, g.id, g.legacy_id, g.title, g.short_title, g.type,
-                       g.published_date, g.in_force, g.in_force_date, g.ministry
-                FROM gazette_links l JOIN gazette g ON g.rowid = l.gazette
-                WHERE l.kind = 'endrer' AND l.target = :target ${clause}
-                ORDER BY g.published_date DESC LIMIT :limit OFFSET :offset`)
-      .all(filters);
-    return { total, rows };
   }
 
   close() {
