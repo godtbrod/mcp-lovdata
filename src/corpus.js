@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +12,16 @@ import { fetchCases, fetchSessions } from "./stortinget.js";
 import { parseDocument } from "./parse.js";
 
 const run = promisify(execFile);
+
+/**
+ * Windows har bsdtar i System32 og forstår C:\-stier. Git Bash sin GNU tar
+ * ligger ofte først i PATH og tolker «C:» som et vertsnavn for fjernarkiv.
+ * Derfor full sti på win32.
+ */
+const TAR =
+  process.platform === "win32"
+    ? join(process.env.SystemRoot || "C:/Windows", "System32", "tar.exe")
+    : "tar";
 
 export const DATASETS = [
   { key: "lover", name: "Gjeldende lover", url: "https://api.lovdata.no/v1/publicData/get/gjeldende-lover.tar.bz2" },
@@ -66,9 +76,9 @@ export async function sync({ log = () => {}, datasets = DATASETS } = {}) {
       const bytes = (await stat(archive)).size;
 
       const dir = join(work, ds.key);
-      await run("mkdir", ["-p", dir]);
+      await mkdir(dir, { recursive: true });
       log(`pakker ut ${(bytes / 1e6).toFixed(1)} MB …`);
-      await run("tar", ["xjf", archive, "-C", dir], { maxBuffer: 1 << 24 });
+      await run(TAR, ["xjf", archive, "-C", dir], { maxBuffer: 1 << 24 });
       await rm(archive);
 
       for (const file of await listXml(dir)) {
