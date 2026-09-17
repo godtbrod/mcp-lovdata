@@ -4,9 +4,7 @@
  * Importerer modulene direkte — ingen JSON-RPC-omvei — så lokale søk
  * svarer på millisekunder.
  */
-import { existsSync } from "node:fs";
-
-import { dbPath } from "./db.js";
+import { dbPath, indexProblem } from "./db.js";
 import { Corpus } from "./query.js";
 
 const ESC = "\u001b";
@@ -78,8 +76,9 @@ function parseArgs(argv) {
 const num = (v, fallback) => (v === undefined ? fallback : Number(v));
 
 function requireIndex() {
-  if (!existsSync(dbPath())) {
-    console.error(`lovdata: ingen indeks i ${dbPath()} — kjør «lovdata sync» først (~2 min).`);
+  const problem = indexProblem();
+  if (problem) {
+    console.error(`lovdata: ${problem} Kjør «lovdata sync» først (~3 min).`);
     process.exit(2);
   }
   return new Corpus();
@@ -338,7 +337,8 @@ const commands = {
   },
 
   status(_args, flags) {
-    if (!existsSync(dbPath())) return console.log(`Ingen indeks i ${dbPath()}. Kjør «lovdata sync».`);
+    const problem = indexProblem();
+    if (problem) return console.log(`${problem} Kjør «lovdata sync».`);
     const corpus = new Corpus();
     const s = corpus.status();
     const fa = corpus.casesStatus();

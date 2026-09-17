@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { decodeEntities, outerElements, parseDocument, stripTags } from "../src/parse.js";
-import { toMatchQuery } from "../src/db.js";
+import { decodeEntities, documentType, outerElements, parseDocument, stripTags } from "../src/parse.js";
+import { indexProblem, openDb, setMeta, toMatchQuery } from "../src/db.js";
 
 test("decodeEntities takler navngitte og numeriske referanser", () => {
   assert.equal(decodeEntities("Bl&aring;b&aelig;r &amp; sm&oslash;r"), "Blåbær & smør");
@@ -84,6 +87,13 @@ test("parseDocument skiller nynorskutgaven fra bokmålsutgaven", () => {
   assert.equal(nn.id, "NL/lov/2020-01-01-1#nn", "samme dokid må ikke overskrive bokmålsutgaven");
 });
 
+test("documentType leser mappa i både Windows- og Unix-stier", () => {
+  // På Windows kommer stiene med «\». Ble de bare delt på «/», fikk alle
+  // dokumentene typen «ukjent», og type-filteret og rangeringen sluttet å virke.
+  assert.equal(documentType("C:\\Temp\\lovdata-x\\lover\\nl\\nl-20050617-062.xml"), "lov");
+  assert.equal(documentType("/tmp/lovdata-x/forskrifter/sf/sf-20170619-0840.xml"), "forskrift");
+});
+
 test("toMatchQuery siterer ord og lar fraser stå", () => {
   assert.equal(toMatchQuery("oppsigelse prøvetid"), '"oppsigelse"* "prøvetid"*');
   assert.equal(toMatchQuery('"tvungent psykisk helsevern"'), '"tvungent psykisk helsevern"');
@@ -112,4 +122,28 @@ test("toMatchQuery beholder ordene når alt er bindeord", () => {
 test("toMatchQuery gir tom streng for tegn som ikke kan indekseres", () => {
   assert.equal(toMatchQuery("§"), "");
   assert.equal(toMatchQuery("   "), "");
+});
+
+test("indexProblem skiller manglende, uferdig og ferdig indeks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lovdata-test-"));
+  const before = process.env.LOVDATA_DB;
+  process.env.LOVDATA_DB = join(dir, "lovdata.db");
+  try {
+    assert.match(indexProblem(), /Ingen lokal indeks/);
+
+    // Slik ser fila ut når første sync stopper før lovtekstene er skrevet:
+    // skjemaet finnes, tabellene er tomme, og synced_at mangler.
+    const db = openDb({ create: true });
+    db.close();
+    assert.match(indexProblem(), /aldri ferdig bygget/, "en tom indeks skal ikke se brukbar ut");
+
+    const done = openDb({ create: true });
+    setMeta(done, "synced_at", new Date().toISOString());
+    done.close();
+    assert.equal(indexProblem(), null);
+  } finally {
+    if (before === undefined) delete process.env.LOVDATA_DB;
+    else process.env.LOVDATA_DB = before;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

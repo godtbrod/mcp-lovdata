@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { dbPath } from "./db.js";
+import { dbPath, indexProblem } from "./db.js";
 import { Corpus } from "./query.js";
 import { sync, syncStortinget } from "./corpus.js";
 import { getCaselaw, searchCaselaw } from "./hudoc.js";
@@ -52,12 +51,12 @@ const server = new McpServer(
 
 let corpus;
 function open() {
-  if (!existsSync(dbPath())) {
-    throw new Error(
-      `Ingen lokal indeks i ${dbPath()}. Kjør verktøyet \`sync\` (eller \`npm run sync\`) én gang først — det tar rundt tre minutter.`,
-    );
+  if (corpus) return corpus;
+  const problem = indexProblem();
+  if (problem) {
+    throw new Error(`${problem} Kjør verktøyet \`sync\` (eller \`npm run sync\`) én gang først — det tar rundt tre minutter.`);
   }
-  corpus ??= new Corpus();
+  corpus = new Corpus();
   return corpus;
 }
 
@@ -319,7 +318,8 @@ server.registerTool(
     inputSchema: {},
   },
   guard(async () => {
-    if (!existsSync(dbPath())) return asText({ indeks: dbPath(), finnes: false, hint: "Kjør sync først." });
+    const problem = indexProblem();
+    if (problem) return asText({ indeks: dbPath(), klar: false, problem, hint: "Kjør sync først." });
     const c = open();
     const s = c.status();
     const forarbeider = c.casesStatus();
@@ -343,8 +343,9 @@ server.registerTool(
     title: "Hent ferske datapakker fra Lovdata",
     description: [
       "Laster ned Lovdata-datasettene på nytt og bygger lovindeksen om fra bunnen,",
-      "og friskner opp forarbeidene fra Stortinget. Tar rundt to minutter.",
-      "En systemd-timer kjører dette ukentlig, så det trengs sjelden manuelt.",
+      "og friskner opp forarbeidene fra Stortinget. Tar rundt tre minutter.",
+      "Indeksen oppdateres bare når sync kjøres — av en timer der det er satt opp,",
+      "ellers ikke. `status` viser hvor gammel den er.",
     ].join(" "),
     inputSchema: {},
   },

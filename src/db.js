@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -83,6 +83,30 @@ export function setMeta(db, key, value) {
     key,
     String(value),
   );
+}
+
+/**
+ * Hvorfor lovindeksen ikke kan brukes, eller null når den kan det.
+ *
+ * At fila finnes er ikke nok. sync oppretter den med skjema før noe er lastet
+ * ned, så en første sync som feiler underveis etterlater tomme tabeller — og
+ * da svarte search «0 treff» og get_article «fant ingen dokumenter» for
+ * arbeidsmiljøloven, uten et ord om at indeksen var tom. synced_at skrives i
+ * samme transaksjon som lovtekstene, rett før COMMIT, så den finnes bare når
+ * indeksen ble ferdig. En senere sync som feiler, ruller tilbake til forrige.
+ */
+export function indexProblem() {
+  const path = dbPath();
+  if (!existsSync(path)) return `Ingen lokal indeks i ${path}.`;
+  let db;
+  try {
+    db = openDb();
+    return getMeta(db, "synced_at") ? null : `Indeksen i ${path} ble aldri ferdig bygget — en sync stoppet underveis.`;
+  } catch (err) {
+    return `Indeksen i ${path} kan ikke leses: ${err.message}`;
+  } finally {
+    db?.close();
+  }
 }
 
 /**
