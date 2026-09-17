@@ -3,9 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { dbPath, indexProblem } from "./db.js";
-import { Corpus } from "./query.js";
-import { sync, syncStortinget } from "./corpus.js";
+import { dbPath, indexProblem, lovtidendPath, lovtidendProblem } from "./db.js";
+import { Corpus, Lovtidend } from "./query.js";
+import { sync, syncLovtidend, syncStortinget } from "./corpus.js";
+import { normalizeArticle, periodEnd, periodStart, toLegacyId, toRefid } from "./lovtidend.js";
 import { getCaselaw, searchCaselaw } from "./hudoc.js";
 import { fetchCase, fetchPublication, publicationId } from "./stortinget.js";
 import { getOpinion, searchOpinions } from "./sivilombudet.js";
@@ -43,6 +44,13 @@ const server = new McpServer(
       "FORVALTNINGSPRAKSIS: `ombudsman_search` og `ombudsman_get` dekker Sivilombudets",
       "uttalelser — tyngst på forvaltningsloven, offentleglova og saksbehandling.",
       "",
+      "ENDRINGSHISTORIKK: `lovtidend_search` og `lovtidend_get` dekker Norsk Lovtidend",
+      "avd. I — kunngjøringen av hver nye lov og forskrift og hver endring i dem, med",
+      "dato, departement, ikrafttredelse og nøyaktig hvilke paragrafer som ble endret.",
+      "Det svarer på HVA som ble endret, NÅR og AV HVILKEN endringslov. Det gir ikke",
+      "lovteksten slik den lød på en gitt dato — historiske versjoner finnes bare i",
+      "Lovdata Pro. Uten `sync ... historikk: true` dekker det bare inneværende år.",
+      "",
       "Sitér alltid paragrafen ordrett og oppgi lov og §-nummer. Datasettet oppdateres",
       "hver natt hos Lovdata; `status` viser hvor gammel den lokale indeksen er.",
     ].join("\n"),
@@ -58,6 +66,20 @@ function open() {
   }
   corpus = new Corpus();
   return corpus;
+}
+
+let gazette;
+function openGazette() {
+  if (gazette) return gazette;
+  const problem = lovtidendProblem();
+  if (problem) {
+    throw new Error(
+      `${problem} Kjør verktøyet \`sync\` én gang — det henter årets kunngjøringer på noen sekunder. ` +
+        "Sett `historikk: true` for årgangene tilbake til 2001 (70 MB, halvannet minutt, ~260 MB på disk).",
+    );
+  }
+  gazette = new Lovtidend();
+  return gazette;
 }
 
 /** Fjerner tomme felt rekursivt, slik at svaret ikke fylles av null. */
@@ -318,8 +340,30 @@ server.registerTool(
     inputSchema: {},
   },
   guard(async () => {
+    const age = (iso) => (iso ? `${((Date.now() - Date.parse(iso)) / 86_400_000).toFixed(1)} døgn` : undefined);
+    const ltProblem = lovtidendProblem();
+    let lovtidend;
+    if (ltProblem) {
+      lovtidend = {
+        klar: false,
+        problem: ltProblem,
+        hint: "Kjør sync. Legg til historikk: true for årgangene tilbake til 2001.",
+      };
+    } else {
+      const s = openGazette().status();
+      lovtidend = {
+        indeks: lovtidendPath(),
+        hentet: s.syncedAt,
+        alder: age(s.syncedAt),
+        kunngjøringer: s.count,
+        årganger: s.years,
+        historikk: s.history ? "2001 og framover er hentet" : "bare inneværende år — kjør sync med historikk: true for 2001–i fjor",
+        fordeling: s.byType,
+      };
+    }
+
     const problem = indexProblem();
-    if (problem) return asText({ indeks: dbPath(), klar: false, problem, hint: "Kjør sync først." });
+    if (problem) return asText({ indeks: dbPath(), klar: false, problem, hint: "Kjør sync først.", lovtidend });
     const c = open();
     const s = c.status();
     const forarbeider = c.casesStatus();
@@ -327,11 +371,12 @@ server.registerTool(
     return asText({
       indeks: dbPath(),
       hentet: s.syncedAt,
-      alder: days === undefined ? undefined : `${days.toFixed(1)} døgn`,
+      alder: age(s.syncedAt),
       dokumenter: s.documents,
       paragrafer: s.articles,
       fordeling: s.byType,
       forarbeider,
+      lovtidend,
       merknad: days > 7 ? "Lovdata legger ut nye datapakker hver natt — vurder å kjøre sync." : undefined,
     });
   }),
@@ -343,21 +388,42 @@ server.registerTool(
     title: "Hent ferske datapakker fra Lovdata",
     description: [
       "Laster ned Lovdata-datasettene på nytt og bygger lovindeksen om fra bunnen,",
-      "og friskner opp forarbeidene fra Stortinget. Tar rundt tre minutter.",
-      "Indeksen oppdateres bare når sync kjøres — av en timer der det er satt opp,",
-      "ellers ikke. `status` viser hvor gammel den er.",
-    ].join(" "),
-    inputSchema: {},
+      "friskner opp forarbeidene fra Stortinget og henter årets Lovtidend. Tar rundt",
+      "tre minutter. Indeksen oppdateres bare når sync kjøres — av en timer der det er",
+      "satt opp, ellers ikke. `status` viser hvor gammel den er.",
+      "",
+      "`historikk: true` tar med Lovtidend tilbake til 2001: 70 MB ekstra nedlasting,",
+      "halvannet minutt og rundt 260 MB på disk. Er den først hentet, holdes den",
+      "oppdatert av hver vanlige sync — uten nedlasting når Lovdata ikke har endret den.",
+    ].join("\n"),
+    inputSchema: {
+      historikk: z
+        .boolean()
+        .optional()
+        .describe("Ta med Lovtidend 2001–i fjor. Uten verdi: bare hvis historikken er hentet før."),
+    },
   },
-  guard(async () => {
+  guard(async ({ historikk }) => {
     if (corpus) {
       corpus.close();
       corpus = undefined;
     }
+    if (gazette) {
+      gazette.close();
+      gazette = undefined;
+    }
     const lines = [];
     const result = await sync({ log: (m) => lines.push(m) });
     const forarbeider = await syncStortinget({ log: (m) => lines.push(m) });
-    return asText({ ...result, forarbeider, logg: lines });
+    // Lovtidend ligger i sin egen fil, så en feil her rører ikke lovindeksen —
+    // da er det bedre å melde fra enn å la hele synken se mislykket ut.
+    let lovtidend;
+    try {
+      lovtidend = await syncLovtidend({ log: (m) => lines.push(m), history: historikk });
+    } catch (err) {
+      lovtidend = { feil: err.message, merknad: "Lovindeksen og forarbeidene ble oppdatert som normalt." };
+    }
+    return asText({ ...result, forarbeider, lovtidend, logg: lines });
   }),
 );
 
@@ -604,6 +670,223 @@ server.registerTool(
       if (!out.tekst) out.merknad = `Fant ingen dokumenttekst for «${sak.reference}». Bruk lenkene i dokumenter.`;
     }
     return asText(out);
+  }),
+);
+
+// ------------------------------------------------------------ Lovtidend
+
+/**
+ * Lovtidend lenker med refid («lov/2005-06-17-62»). Brukeren skriver som
+ * regel navnet, så navn slås opp i lovindeksen først.
+ */
+function asRefid(value) {
+  const direct = toRefid(value);
+  if (direct) return { refid: direct };
+  const matches = open().resolve(value);
+  if (!matches.length) return {};
+  return { refid: toRefid(matches[0].id), tolket: `${label(matches[0])} (${matches[0].legacy_id ?? matches[0].id})` };
+}
+
+/** Navnene på dokumentene en kunngjøring peker på, når lovindeksen har dem. */
+function namesFor(refids) {
+  const names = new Map();
+  let corpusRef;
+  try {
+    corpusRef = open();
+  } catch {
+    return names;
+  }
+  for (const refid of new Set(refids)) {
+    const doc = corpusRef.byLegacy(toLegacyId(refid));
+    if (doc) names.set(refid, label(doc));
+  }
+  return names;
+}
+
+/**
+ * «lov/2005-06-17-62» + [§14-5, §15-6] → «arbeidsmiljøloven §14-5, §15-6».
+ * En statsbudsjettforskrift kan endre hundre dokumenter; da kortes lista ned.
+ */
+function describeLinks(links, names, { maxTargets = 12, maxArticles = 15 } = {}) {
+  const byTarget = new Map();
+  for (const l of links) {
+    const list = byTarget.get(l.target) ?? [];
+    if (l.article) list.push(l.article);
+    byTarget.set(l.target, list);
+  }
+  const out = [...byTarget].slice(0, maxTargets).map(([target, articles]) => {
+    const shown = articles.slice(0, maxArticles).join(", ");
+    const more = articles.length > maxArticles ? ` … (+${articles.length - maxArticles})` : "";
+    return `${names.get(target) ?? toLegacyId(target) ?? target}${articles.length ? ` ${shown}${more}` : ""}`;
+  });
+  if (byTarget.size > maxTargets) out.push(`… og ${byTarget.size - maxTargets} dokumenter til`);
+  return out;
+}
+
+/** Enkelte kunngjøringstitler lister opp alle forskriftene de endrer. */
+const shorten = (s, max = 180) => (s && s.length > max ? `${s.slice(0, max).trimEnd()} …` : s);
+
+const gazetteRef = (h) => ({
+  id: h.id,
+  kode: h.legacy_id ?? undefined,
+  type: h.type,
+  tittel: shorten(h.short_title || h.title),
+  kunngjort: h.published_date ?? undefined,
+  iKraft: h.in_force ?? undefined,
+  departement: h.ministry ?? undefined,
+  etat: h.agency ?? undefined,
+  url: `https://lovdata.no/dokument/${h.id}`,
+});
+
+server.registerTool(
+  "lovtidend_search",
+  {
+    title: "Søk i Norsk Lovtidend",
+    description: [
+      "Kunngjøringene i Norsk Lovtidend avd. I: hver nye lov og forskrift, og hver",
+      "endring i dem, slik den ble kunngjort — med dato, departement, ikrafttredelse",
+      "og hvilke bestemmelser som ble endret. Det er her svaret står på «hva ble",
+      "endret i ferieloven i 2024», «hvilken lov endret arbeidsmiljøloven § 15-6» og",
+      "«hva har Landbruks- og matdepartementet kunngjort i år».",
+      "",
+      "MERK: dette er endringene, ikke lovteksten slik den lød på en gitt dato.",
+      "Historiske versjoner av en lov finnes bare i Lovdata Pro. Gjeldende tekst",
+      "henter du med `get_article`, som også lister hvilke endringslover som har",
+      "endret paragrafen.",
+      "",
+      "`endrer` tar navnet på loven eller forskriften som ble endret",
+      "(«ferieloven», «LOV-2005-06-17-62»), `paragraf` snevrer inn til én",
+      "bestemmelse. Uten `query` er svaret en ren liste, sist kunngjort først.",
+      "",
+      "Årganger før inneværende år krever at `sync` er kjørt med `historikk: true`;",
+      "`status` viser hvilke år som er hentet.",
+    ].join("\n"),
+    inputSchema: {
+      query: z.string().optional().describe("Søkeord i kunngjøringsteksten. Kan sløyfes når filtrene er nok."),
+      endrer: z
+        .string()
+        .optional()
+        .describe('Dokumentet som ble endret — navn, dokid eller kode, f.eks. "ferieloven".'),
+      paragraf: z.string().optional().describe('Bare endringer i denne bestemmelsen, f.eks. "§ 15-6". Krever `endrer`.'),
+      hjemmel: z
+        .string()
+        .optional()
+        .describe('Bare kunngjøringer gitt med hjemmel i dette dokumentet, f.eks. "matloven".'),
+      type: z.enum(["lov", "forskrift"]).optional(),
+      ministry: z.string().optional().describe('Delstreng av departement eller etat, f.eks. "Landbruks".'),
+      from: z.string().optional().describe('Kunngjort fra og med, "2024", "2024-03" eller "2024-03-01".'),
+      to: z.string().optional().describe("Kunngjort til og med, samme former."),
+      inForceFrom: z.string().optional().describe("Trådte i kraft fra og med. Mange har ingen dato («Kongen bestemmer»)."),
+      inForceTo: z.string().optional().describe("Trådte i kraft til og med."),
+      limit: z.number().int().min(1).max(50).default(10),
+      offset: z.number().int().min(0).default(0),
+    },
+  },
+  guard(async ({ query, endrer, paragraf, hjemmel, type, ministry, from, to, inForceFrom, inForceTo, limit, offset }) => {
+    const lt = openGazette();
+    const tolket = {};
+    let endrerRef;
+    let hjemmelRef;
+    if (endrer) {
+      const r = asRefid(endrer);
+      if (!r.refid) return asError(`Fant ingen lov eller forskrift som matcher «${endrer}».`);
+      endrerRef = r.refid;
+      if (r.tolket) tolket.endrer = r.tolket;
+    }
+    if (hjemmel) {
+      const r = asRefid(hjemmel);
+      if (!r.refid) return asError(`Fant ingen lov eller forskrift som matcher «${hjemmel}».`);
+      hjemmelRef = r.refid;
+      if (r.tolket) tolket.hjemmel = r.tolket;
+    }
+    if (paragraf && !endrerRef) return asError("`paragraf` må kombineres med `endrer` — ellers vet vi ikke hvilken lovs paragraf det gjelder.");
+
+    const { total, hits } = lt.search({
+      query,
+      endrer: endrerRef,
+      article: paragraf ? normalizeArticle(paragraf) : undefined,
+      hjemmel: hjemmelRef,
+      type,
+      ministry,
+      from: periodStart(from),
+      to: periodEnd(to),
+      inForceFrom: periodStart(inForceFrom),
+      inForceTo: periodEnd(inForceTo),
+      limit,
+      offset,
+    });
+    const names = namesFor(hits.flatMap((h) => h.changes.map((c) => c.target)));
+    return asText(
+      compact({
+        total,
+        vist: hits.length,
+        tolket: Object.keys(tolket).length ? tolket : undefined,
+        kunngjøringer: hits.map((h) => ({
+          ...gazetteRef(h),
+          endrer: describeLinks(h.changes, names),
+          utdrag: query ? h.snippet : undefined,
+        })),
+        hint:
+          hits.length === 0
+            ? paragraf
+              ? "Ingen treff. Paragrafene leses ut av teksten i eldre kunngjøringer og kan mangle — prøv uten `paragraf`."
+              : "Ingen treff. Sjekk `status` for hvilke årganger som er hentet, eller løsne på filtrene."
+            : total > hits.length + offset
+              ? "Flere treff finnes — bruk offset for å bla."
+              : undefined,
+      }),
+    );
+  }),
+);
+
+server.registerTool(
+  "lovtidend_get",
+  {
+    title: "Hent én kunngjøring fra Lovtidend",
+    description: [
+      "Hele kunngjøringsteksten — altså endringsloven eller endringsforskriften slik",
+      "den ble vedtatt, med nøyaktig ordlyd på hver endring («§ 15-6 tredje ledd skal",
+      "lyde: …»), hvilke dokumenter den endrer, hjemmel, og forarbeidene den bygger på",
+      "(Prop. og Innst. står i feltet `annet`).",
+      "",
+      "Står det «Kongen bestemmer» om ikrafttredelsen, er datoen satt senere ved",
+      "kgl.res.; de kunngjøringene listes i `ikraftsattVed`.",
+      "",
+      "Referansen er koden («LOV-2023-12-15-88»), dokid eller refid fra et søketreff.",
+    ].join("\n"),
+    inputSchema: {
+      reference: z.string().min(3).describe('F.eks. "LOV-2023-12-15-88" eller "LTI/lov/2023-12-15-88".'),
+      maxChars: z.number().int().min(1000).max(200_000).default(40_000),
+    },
+  },
+  guard(async ({ reference, maxChars }) => {
+    const lt = openGazette();
+    const doc = lt.get(reference);
+    if (!doc) {
+      return asError(
+        `Fant ingen kunngjøring som matcher «${reference}». Kunngjøringer slås opp på kode (LOV-2023-12-15-88), ` +
+          "dokid eller refid — bruk lovtidend_search for å finne den.",
+      );
+    }
+    const names = namesFor([...doc.changes, ...doc.basedOn].map((l) => l.target));
+    const truncated = doc.text.length > maxChars;
+    return asText(
+      compact({
+        ...gazetteRef(doc),
+        fullTittel: doc.title,
+        iKraftDato: doc.in_force_date ?? undefined,
+        kunngjortTidspunkt: doc.published ?? undefined,
+        journalnummer: doc.journal_number ?? undefined,
+        rettsområde: doc.legal_areas ?? undefined,
+        endrer: describeLinks(doc.changes, names),
+        hjemmel: describeLinks(doc.basedOn, names),
+        annet: doc.misc ?? undefined,
+        ikraftsattVed: doc.inForceBy.map((r) => `${r.legacy_id ?? r.id}: i kraft ${r.in_force} (kunngjort ${r.published_date})`),
+        totaltAntallTegn: doc.text.length,
+        avkortet: truncated || undefined,
+        tekst: truncated ? `${doc.text.slice(0, maxChars)}\n\n[… avkortet, øk maxChars]` : doc.text,
+      }),
+    );
   }),
 );
 
